@@ -236,6 +236,27 @@ periodic rounds: 11 with the default settings and a progress worker, fewer in pi
 after changing the shape, since a bigger fleet needs more. The pool is
 described in [operating.md](operating.md#the-claude-login-pool).
 
+### Two sign-ins instead of a pool
+
+Each pool login stops renewing about 28 days after its sign-in, so the pool asks for eleven
+sign-ins a month. With a `claude setup-token` token, the fleet needs one sign-in a month instead.
+Run `claude setup-token` as the fleet user, then paste the token it prints into the file:
+
+```bash
+mkdir -p ~/.config/tauceti && (umask 077; read -rsp "token: " t && echo "$t" > ~/.config/tauceti/claude-setup-token)
+```
+
+```toml
+[claude]
+token_file = "~/.config/tauceti/claude-setup-token"
+```
+
+Every worker's agents then run on that token, which lasts a year and never rotates, so the workers
+can share it. Its scope cannot read the usage endpoint, so the pacer reads usage through one ordinary
+login, which `tauceti-fleet logins` names (`CLAUDE_CONFIG_DIR=…/logins/usage claude auth login`).
+That login needs a fresh sign-in about every 28 days. The attention list asks for it four days ahead,
+and asks for a new token a month before the old one's year runs out.
+
 Before the fleet, check the pieces offline, then run one supervised round:
 
 ```bash

@@ -145,6 +145,11 @@ STORE_GRACE_S = 6 * 3600  # a revision unpinned this long is pruned; a round sta
 API = setting("claude", "billing", "subscription").strip().lower() == "api"
 API_KEY_FILE = _expand(setting("claude", "api_key_file", "~/.config/tauceti/anthropic.key"))
 API_BUDGET = setting("claude", "budget", "true").strip().lower() not in ("false", "0", "no")
+# `[claude] token_file`: a `claude setup-token` token that every worker's agents run on. It lasts a year
+# and never rotates, so the workers share it and the login pool goes unused; the pacer reads usage
+# through one ordinary login instead (USAGE_LOGIN below), which the token's scope cannot.
+_TOKEN_FILE_RAW = setting("claude", "token_file")
+TOKEN_FILE = _expand(_TOKEN_FILE_RAW) if _TOKEN_FILE_RAW and not API else None
 CONFIG = FLEET_HOME / "workers.toml"
 STATE = FLEET_HOME / "state"
 GATE_DIR = FLEET_HOME / "gate"
@@ -324,6 +329,14 @@ def api_budget_text(b: dict | None) -> tuple[str, str]:
 
 LOGINS = FLEET_HOME / "logins"
 LEASES = LOGINS / "leases.json"
+# Token mode (TOKEN_FILE): the token staged as a credentials file the worker seeds from, and the login
+# the pacer reads usage with. Neither is a pool chain.
+TOKEN_DIR = LOGINS / "token"
+USAGE_LOGIN = LOGINS / "usage"
+SETUP_TOKEN_LIFETIME_S = 365 * 86400
+TOKEN_WARN_S = 30 * 86400
+# A Claude login stops renewing 27-30 days after its sign-in (refreshTokenExpiresAt; measured 2026-11-02).
+USAGE_WARN_S = 4 * 86400
 
 
 # ----------------------------------------------------------------------------- Claude login pool
@@ -346,8 +359,8 @@ def login_slots() -> list[Path]:
     """Every login chain the owner created: a subdirectory of the pool holding a .credentials.json."""
     if not LOGINS.is_dir():
         return []
-    return sorted((d for d in LOGINS.iterdir() if d.is_dir() and (d / ".credentials.json").is_file()),
-                  key=lambda d: d.name)
+    return sorted((d for d in LOGINS.iterdir() if d.is_dir() and (d / ".credentials.json").is_file()
+                   and d not in (TOKEN_DIR, USAGE_LOGIN)), key=lambda d: d.name)
 
 
 def read_leases() -> dict[str, str]:
@@ -361,7 +374,9 @@ def assign_leases(specs: list[dict]) -> dict[str, str]:
     claude/auto workers without one, in config order, healthy ones first. A worker whose chain can no
     longer be renewed (chain_failing_since) moves to a healthy free chain when there is one. Workers
     left over share the operator's ~/.claude (and `tauceti-fleet logins` says so). Reads the chains'
-    refresh markers; the caller writes the result."""
+    refresh markers; the caller writes the result. Token mode leases nothing."""
+    if TOKEN_FILE is not None:
+        return {}
     chains = login_slots()
     slots = {d.name for d in chains}
     failing = {d.name for d in chains if chain_failing_since(d) is not None}
@@ -391,14 +406,27 @@ def login_dir(wid: str, leases: dict[str, str] | None = None) -> Path | None:
     return LOGINS / slot if slot and (LOGINS / slot / ".credentials.json").is_file() else None
 
 
+def claude_source(wid: str, leases: dict[str, str] | None = None) -> Path | None:
+    """The Claude credential directory this worker seeds from: the staged setup-token in token mode,
+    else its leased chain, else None (the operator's ~/.claude)."""
+    return TOKEN_DIR if TOKEN_FILE is not None else login_dir(wid, leases)
+
+
+def claude_env(wid: str, leases: dict[str, str] | None = None) -> dict[str, str]:
+    d = claude_source(wid, leases)
+    env = {} if d is None else {"CLAUDE_CONFIG_DIR": str(d)}
+    if TOKEN_FILE is not None:
+        env["TAUCETI_CLAUDE_USAGE_CREDENTIALS"] = str(USAGE_LOGIN / ".credentials.json")
+    return env
+
+
 def with_logins(specs: list[dict], leases: dict[str, str]) -> list[dict]:
-    """Point each leased worker's CLAUDE_CONFIG_DIR at its chain (the worker seeds its private mirror
-    from there and renews there)."""
+    """Point each worker's CLAUDE_CONFIG_DIR at its credential source (the worker seeds its private
+    mirror from there and renews there)."""
     for s_ in specs:
-        d = login_dir(s_["id"], leases)
         s_["env"].pop("CLAUDE_CONFIG_DIR", None)
-        if d is not None:
-            s_["env"]["CLAUDE_CONFIG_DIR"] = str(d)
+        s_["env"].pop("TAUCETI_CLAUDE_USAGE_CREDENTIALS", None)
+        s_["env"].update(claude_env(s_["id"], leases))
     return specs
 
 
@@ -410,7 +438,52 @@ def lease_logins(specs: list[dict], persist: bool = True) -> list[dict]:
     leases = assign_leases(specs)
     if persist:
         write_leases(leases)
+        if TOKEN_FILE is not None:
+            stage_setup_token()
     return with_logins(specs, leases)
+
+
+def stage_setup_token() -> str | None:
+    """Write the token as logins/token/.credentials.json, the shape Claude Code reads (an access token,
+    no refresh token, the usage login's subscription fields), when that file differs. In a throwaway
+    child, like _claude_file_expiry, so the token never enters this process. Returns a problem, or None."""
+    try:
+        st = TOKEN_FILE.stat()
+    except OSError:
+        return f"no setup-token at {TOKEN_FILE}: run `claude setup-token` and save the token there (mode 600)"
+    if st.st_mode & 0o077:
+        return f"{TOKEN_FILE} is readable by others: chmod 600 {TOKEN_FILE}"
+    script = (
+        "import json,os,sys,tempfile\n"
+        "src,dst,exp,usage=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]\n"
+        "tok=open(src).read().strip()\n"
+        "if not tok.startswith('sk-ant-oat'): print('bad'); sys.exit()\n"
+        "try: u=json.load(open(usage))['claudeAiOauth']\n"
+        "except Exception: u={}\n"
+        "blk={'accessToken':tok,'expiresAt':exp,'scopes':['user:inference']}\n"
+        "blk.update({k:u[k] for k in ('subscriptionType','rateLimitTier') if u.get(k)})\n"
+        "want={'claudeAiOauth':blk}\n"
+        "try: cur=json.load(open(dst))\n"
+        "except Exception: cur=None\n"
+        "if cur==want: print('same'); sys.exit()\n"
+        "os.makedirs(os.path.dirname(dst),mode=0o700,exist_ok=True)\n"
+        "fd,tmp=tempfile.mkstemp(dir=os.path.dirname(dst),prefix='.stage.')\n"
+        "with os.fdopen(fd,'w') as f: json.dump(want,f)\n"
+        "os.chmod(tmp,0o600); os.replace(tmp,dst); print('changed')\n")
+    expires_ms = int((st.st_mtime + SETUP_TOKEN_LIFETIME_S) * 1000)
+    try:
+        out = subprocess.run(["python3", "-c", script, str(TOKEN_FILE), str(TOKEN_DIR / ".credentials.json"),
+                              str(expires_ms), str(USAGE_LOGIN / ".credentials.json")],
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not stage the setup-token ({type(exc).__name__})"
+    if out == "bad":
+        return f"{TOKEN_FILE} does not hold a setup-token (sk-ant-oat…): run `claude setup-token` again"
+    if out not in ("same", "changed"):
+        return "could not stage the setup-token"
+    if out == "changed":
+        _watchdog_note(f"setup-token staged in {TOKEN_DIR}")
+    return None
 
 
 def reset_stale_mirror(wid: str) -> str | None:
@@ -424,7 +497,7 @@ def reset_stale_mirror(wid: str) -> str | None:
     marker = iso / ".tauceti-creds-source"
     if not marker.is_file():
         return None
-    expected = login_dir(wid) or (HOME / ".claude")
+    expected = claude_source(wid) or (HOME / ".claude")
     if marker.read_text().strip() == str(expected):
         return None
     for f in (iso / ".credentials.json", marker):
@@ -473,8 +546,11 @@ def freshen_logins(quiet: bool = True) -> list[str]:
         return []
     leased = set(read_leases().values())
     notes = []
-    for d in login_slots():
-        if d.name in leased:
+    # In token mode the usage login is the one chain left, and nothing leases it: its workers' pacers
+    # renew it too, under the same lock and cooldown.
+    chains = [USAGE_LOGIN] if TOKEN_FILE is not None else [d for d in login_slots() if d.name not in leased]
+    for d in chains:
+        if not (d / ".credentials.json").is_file():
             continue
         prov = credential_refresh.provider("claude", credentials=d / ".credentials.json")
         try:
@@ -828,6 +904,20 @@ def _marker_at(path: Path) -> float | None:
         return None
 
 
+def _claude_refresh_expiry(path: Path) -> float | None:
+    """When this login's refresh token stops working (refreshTokenExpiresAt), or None when the file is
+    unreadable or does not say. In a throwaway child, as _claude_file_expiry."""
+    try:
+        p = subprocess.run(
+            ["python3", "-c",
+             "import json,sys; print(json.load(open(sys.argv[1]))['claudeAiOauth'].get('refreshTokenExpiresAt') or 0)",
+             str(path)], capture_output=True, text=True, timeout=15)
+        ms = int(p.stdout.strip() or 0) if p.returncode == 0 else 0
+    except Exception:
+        return None
+    return ms / 1000 if ms else None
+
+
 def chain_failing_since(d: Path, expiry: float | None = None) -> float | None:
     """When this chain's current access token expired, if a renewal was tried after that, none has
     succeeded since and nobody has signed in since; else None. A token that merely expired while no
@@ -858,6 +948,9 @@ def login_incidents() -> None:
     the credential changes."""
     if API or IS_MAC:
         return
+    if TOKEN_FILE is not None:
+        token_incidents()
+        return
     holder = {slot: w for w, slot in read_leases().items()}
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for d in login_slots():
@@ -887,9 +980,84 @@ def login_incidents() -> None:
             pass
 
 
+def _token_problems() -> dict[str, tuple[str, int]]:
+    """Token mode's sign-in needs, as {incident key: (what to do, version of the credential it is about)}:
+    the setup-token missing, unusable or due within TOKEN_WARN_S, and the usage login missing, failing
+    to renew, or due to stop renewing within USAGE_WARN_S. Empty when nothing needs the owner."""
+    user = _pwd.getpwuid(os.getuid()).pw_name
+    out: dict[str, tuple[str, int]] = {}
+    try:
+        tok_at = int(TOKEN_FILE.stat().st_mtime)
+    except OSError:
+        tok_at = 0
+    if problem := stage_setup_token():
+        out["token"] = (f"every Claude worker is stopped: {problem}", tok_at)
+    elif (left := tok_at + SETUP_TOKEN_LIFETIME_S - time.time()) < TOKEN_WARN_S:
+        out["token"] = (f"the setup-token in {TOKEN_FILE} expires in about {max(0, left) / 86400:.0f} days: as {user}, "
+                        f"run `claude setup-token` and save the new token there (mode 600)", tok_at)
+    cred = USAGE_LOGIN / ".credentials.json"
+    signin = f"as {user}: CLAUDE_CONFIG_DIR={USAGE_LOGIN} claude auth login"
+    try:
+        at = int(cred.stat().st_mtime)
+    except OSError:
+        out["usage"] = (f"no usage login, so the pacer cannot read Claude usage and no Claude worker starts. Sign in once {signin}", 0)
+        return out
+    got = _claude_file_expiry(cred)
+    rt_end = _claude_refresh_expiry(cred)
+    if got is None or not got[1]:
+        out["usage"] = (f"the usage login cannot be renewed (no refresh token). Sign in again {signin}", at)
+    elif (since := chain_failing_since(USAGE_LOGIN, got[0])) is not None:
+        out["usage"] = (f"the usage login's token expired {time.strftime('%m-%d %H:%MZ', time.gmtime(since))} and every "
+                        f"renewal since has failed, so no Claude worker starts. Sign in again {signin}", at)
+    elif rt_end is not None and rt_end - time.time() < USAGE_WARN_S:
+        when = time.strftime("%a %m-%d %H:%MZ", time.gmtime(rt_end))
+        out["usage"] = (f"the usage login stops renewing {when}; Claude workers stop then. Sign in again before that {signin}", at)
+    return out
+
+
+def token_incidents() -> None:
+    """login_incidents for token mode: one item per entry of _token_problems, and none left for the
+    pool chains token mode does not use."""
+    problems = _token_problems()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for path in INCIDENTS.glob("login-*.json") if INCIDENTS.is_dir() else []:
+        if path.stem.removeprefix("login-") not in problems:
+            path.unlink(missing_ok=True)
+    for key, (detail, version) in problems.items():
+        path = INCIDENTS / f"login-{key}.json"
+        acked = ACKED / path.name
+        if acked.is_file() and read_json(acked).get("credential_at") == version:
+            continue
+        prev = read_json(path) if path.is_file() else {}
+        rec = {"kind": "login", "key": key, "worker": "all Claude workers",
+               "first_at": prev.get("first_at") or now, "last_at": now, "credential_at": version, "detail": detail}
+        try:
+            INCIDENTS.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rec, indent=1) + "\n")
+        except OSError:
+            pass
+
+
+def _token_line() -> tuple[str, str]:
+    problems = _token_problems()
+    try:
+        days = (TOKEN_FILE.stat().st_mtime + SETUP_TOKEN_LIFETIME_S - time.time()) / 86400
+        text = f"logins: setup-token for every worker (~{days:.0f} d left)"
+    except OSError:
+        text = "logins: setup-token MISSING"
+    rt_end = _claude_refresh_expiry(USAGE_LOGIN / ".credentials.json")
+    if rt_end is not None:
+        text += f"; usage login renews until {time.strftime('%m-%d', time.gmtime(rt_end))}"
+    if problems:
+        text += " — " + "; ".join(sorted(problems)) + " needs a sign-in (tauceti-fleet logins)"
+    return text, "red" if problems else "green"
+
+
 def _login_pool_line() -> tuple[str, str] | None:
     """One line on the login pool: chains, leases, nearest expiry, and any chain that can no longer be
     renewed (a sign-in is the only fix for that). None when there is no pool (macOS, or none made)."""
+    if TOKEN_FILE is not None and not IS_MAC:
+        return _token_line()
     slots = login_slots()
     if not slots:
         return None if IS_MAC else ("logins: none — every Claude worker shares ~/.claude (tauceti-fleet logins)", "yellow")
@@ -1000,9 +1168,9 @@ def operator_claude_users() -> list[str] | None:
     for wid, body in parse_blocks(CONFIG.read_text()).items():
         agent = re.search(r'^agent\s*=\s*"([^"]+)"', body, re.M)
         enabled = not re.search(r"^enabled\s*=\s*false", body, re.M)
-        if enabled and agent and agent.group(1) in ("claude", "auto") and login_dir(wid, leases) is None:
+        if enabled and agent and agent.group(1) in ("claude", "auto") and claude_source(wid, leases) is None:
             users.append(wid)
-    if login_dir(PERIODIC_WID, leases) is None:
+    if claude_source(PERIODIC_WID, leases) is None:
         users.append(PERIODIC_WID)
     return users
 
@@ -1038,7 +1206,7 @@ def credential_lines() -> list[tuple[str, str]]:
     if users == []:
         # Every Claude worker and the periodic rounds sign in with a chain of their own, so ~/.claude
         # is never read; telling the owner to log in there would only invite a shared login.
-        claude = ("claude: ~/.claude unused (every worker holds a login chain)", "green")
+        claude = ("claude: ~/.claude unused (every worker " + ("runs on the setup-token)" if TOKEN_FILE else "holds a login chain)"), "green")
     else:
         claude = _claude_operator_expiry()
         if users:
@@ -1758,9 +1926,8 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         env.pop(var, None)  # a hook's environment carries the worker's values; fleet.toml decides
     if not API:
         env.update(provider_paces())
-    d = login_dir(PERIODIC_WID)
-    if d is not None:
-        env["CLAUDE_CONFIG_DIR"] = str(d)
+    env.pop("TAUCETI_CLAUDE_USAGE_CREDENTIALS", None)
+    env.update(claude_env(PERIODIC_WID))
     return env
 
 
@@ -1900,7 +2067,7 @@ def cmd_periodic(a: argparse.Namespace) -> int:
         when = f"last run {age(last.stat().st_mtime)} ago" if last.exists() else "never run"
         state = "disabled (decide.enabled = false in fleet.toml)" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
         print(f"  {stage:9s} every {gap // 3600} h — {when}; {state}")
-    print(f"logs: {STATE / 'logs' / PERIODIC_WID}/   login chain: {login_dir(PERIODIC_WID) or 'shared ~/.claude'}")
+    print(f"logs: {STATE / 'logs' / PERIODIC_WID}/   login chain: {claude_source(PERIODIC_WID) or 'shared ~/.claude'}")
     return 0
 
 
@@ -3931,6 +4098,8 @@ def cmd_logins(a: argparse.Namespace) -> int:
         if problem := api_key_problem():
             print(f"  {problem}")
         return 0
+    if TOKEN_FILE is not None:
+        return _logins_token_mode()
     if CONFIG.is_file():
         shape = _shape_from_config(a)
     else:
@@ -4006,6 +4175,32 @@ def cmd_logins(a: argparse.Namespace) -> int:
               "renewed without you: leased ones by their worker before each launch, free ones by the fleet.")
     if IS_MAC:
         print("\n(macOS: logins live in the Keychain, not in files; the pool is for the Linux fleet host.)")
+    return 0
+
+
+def _logins_token_mode() -> int:
+    print(f"token mode (claude.token_file): every Claude worker runs on the setup-token in {TOKEN_FILE},")
+    print(f"staged as {TOKEN_DIR}/.credentials.json, and the pacer reads usage through {USAGE_LOGIN}.")
+    problems = _token_problems()
+    try:
+        days = (TOKEN_FILE.stat().st_mtime + SETUP_TOKEN_LIFETIME_S - time.time()) / 86400
+        print(f"  setup-token  {'ok' if 'token' not in problems else 'NEEDS YOU'}, about {days:.0f} days left")
+    except OSError:
+        print("  setup-token  MISSING")
+    got = _claude_file_expiry(USAGE_LOGIN / ".credentials.json")
+    rt_end = _claude_refresh_expiry(USAGE_LOGIN / ".credentials.json")
+    if got is None:
+        print("  usage login  MISSING")
+    else:
+        until = f", renews until {time.strftime('%Y-%m-%d %H:%MZ', time.gmtime(rt_end))}" if rt_end else ""
+        print(f"  usage login  {'ok' if 'usage' not in problems else 'NEEDS YOU'}, token {(got[0] - time.time()) / 3600:.1f} h{until}")
+    for detail, _ in problems.values():
+        print(f"\n{detail}")
+    if not problems:
+        print("\nNothing to do. The fleet warns in the attention list "
+              f"{TOKEN_WARN_S // 86400} days before the token and {USAGE_WARN_S // 86400} days before the usage login lapse.")
+    if pool := login_slots():
+        print(f"\n{len(pool)} pool chain(s) under {LOGINS} are unused in token mode ({', '.join(d.name for d in pool)}).")
     return 0
 
 
