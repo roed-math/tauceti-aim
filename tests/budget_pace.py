@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
-WORKER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TAUCETI_FLEET_WORKER", "~/claude/TauCetiWorker-v2")).expanduser()
+WORKER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TAUCETI_TEST_WORKER", "~/claude/TauCetiWorker-v2")).expanduser()
 TMP = Path(tempfile.mkdtemp(prefix="budget-pace-"))
 HOME = TMP / "fleet"
 WORKTREE = TMP / "worker"

@@ -28,9 +28,18 @@ only fleet-specific files here are the target lists.
 
 ## What you need
 
-- **A host.** Ubuntu with Incus, so that every round runs in an egress-denied container (bubble).
-  Each fleet runs as its own Unix user, which needs no sudo and, through `incus-user`, is not
-  root-equivalent either.
+- **A host.** Ubuntu with Incus, so that the rounds that touch pull requests run in an egress-denied
+  container (bubble). Each fleet runs as its own Unix user, which needs no sudo and, through
+  `incus-user`, is not root-equivalent either. Where each kind of round runs:
+
+  | Round | Where its agent runs |
+  |---|---|
+  | author, fix, fix-ci, rebase, review | in bubble (`up.sandbox = "bubble"`, the Linux default) |
+  | curate, decide | on the host, as the fleet's user |
+  | progress reports (off unless enabled) | on the host, as the fleet's user |
+
+  So the fleet's Unix user is the boundary for the host rounds: give it nothing it should not read,
+  and no membership of `incus-admin` (see [setup](docs/setup.md#2-a-fleet-user-once-per-user-as-a-sudoer)).
   Ten workers run on 32 cores and 96 GB of memory. Disk runs out first: about 20 GB per worker
   checkout, plus the Mathlib cache. macOS works without the sandbox
   (`up.sandbox = "host"`), which is fine for trying it and not for leaving it unattended.
@@ -87,7 +96,10 @@ cleanly.
 A fleet lives in one directory, its **home**: `$TAUCETI_FLEET_HOME`, default `~/.tauceti-fleet`.
 It holds the settings (`fleet.toml`), the generated worker config (`workers.toml`), the GitHub gate,
 the Claude login pool, and every worker's logs (`state/logs/<id>/`). To run a second fleet as the
-same user, give it another home and export `TAUCETI_FLEET_HOME` for every command about it.
+same user, give it another home and export `TAUCETI_FLEET_HOME` for every command about it: a home
+other than the default gets its own worker-manager socket and its own schedule timer
+(`tauceti-fleet-schedule-<hash>`), so the two fleets' managers and timers stay apart. A separate Unix
+user per fleet is still the better setup, since the fleets then cannot read each other's credentials.
 
 `init` writes `fleet.toml` with comments; edit it afterwards as you like.
 
@@ -96,7 +108,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `fleet.name` | short lowercase word; worker ids are `<name>-c1`, `<name>-fix1`, `<name>-rev1`, … | required |
 | `fleet.targets` | the target list the authors work through; several fleets may share one (docs/setup.md); `"none"`: no list, no curator, and each author picks a roadmap area itself | required |
 | `fleet.github_login` | the GitHub account every worker must act as; any other identity halts the worker | required |
-| `fleet.claim_repo` | the project-wide claim namespace; every fleet must agree on it | `TauCetiProject/tauceti-claims` |
+| `fleet.claim_repo` | the claim namespace; fleets that must coordinate have to agree on it | unset: the worker chooses the shared namespace when the account has access, else the account's fork |
 | `fleet.status_dir` | a directory the fleet users share, where each fleet publishes its view for `watch --fleets` (docs/operating.md) | unset (no publishing) |
 | `fleet.shared_cache` | a directory the fleets on one account share for their PR scoreboard reads, so a fleet starting its slot reads on from the previous one's (docs/setup.md) | unset (each fleet's own gate store) |
 | `paths.worker` | a TauCetiWorker checkout (see Requirements) | `~/TauCetiWorker-v2` |

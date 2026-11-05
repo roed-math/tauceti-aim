@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Run every controller test against one worker checkout.
+#   tests/run-all [WORKER_CHECKOUT]
+# The checkout is, in order: the argument, $TAUCETI_TEST_WORKER, ../TauCetiWorker-v2 beside this
+# repository, ~/TauCetiWorker-v2. Tests read it as $TAUCETI_TEST_WORKER: $TAUCETI_FLEET_WORKER would
+# override the worker each test's own fleet.toml names. Its own .venv python runs the tests when it has one (it carries
+# `rich`, which the view tests need); else python3.
+set -u
+here=$(cd "$(dirname "$0")/.." && pwd)
+worker=${1:-${TAUCETI_TEST_WORKER:-}}
+for cand in "$worker" "$here/../TauCetiWorker-v2" "$HOME/TauCetiWorker-v2"; do
+    [[ -n "$cand" && -d "$cand/tauceti_worker" ]] && { worker=$(cd "$cand" && pwd); break; }
+done
+[[ -d "$worker/tauceti_worker" ]] || { echo "run-all: no worker checkout found (pass one, or set TAUCETI_TEST_WORKER)" >&2; exit 2; }
+py=python3
+[[ -x "$worker/.venv/bin/python" ]] && py="$worker/.venv/bin/python"
+echo "worker: $worker @ $(git -C "$worker" log -1 --format='%h %s' 2>/dev/null | cut -c1-60)"
+echo "python: $py"
+export TAUCETI_TEST_WORKER="$worker"
+unset TAUCETI_FLEET_WORKER TAUCETI_FLEET_HOME
+pass=0 fail=0 failed=()
+for t in "$here"/tests/*.py; do
+    if out=$("$py" "$t" 2>&1); then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1)); failed+=("$(basename "$t")")
+        echo "---- $(basename "$t")"; echo "$out" | grep -E "^(FAIL|Traceback)|Error" | head -8
+    fi
+done
+echo "run-all: $pass passed, $fail failed${failed:+: ${failed[*]}}"
+[[ $fail -eq 0 ]]

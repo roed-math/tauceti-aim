@@ -17,7 +17,7 @@ every account that runs a fleet. A note on macOS is at the end.
 ## 1. Host tools (once, as a sudoer)
 
 ```bash
-sudo apt update && sudo apt install -y git curl build-essential python3 python3-venv nodejs npm util-linux-extra
+sudo apt update && sudo apt install -y git curl build-essential python3 python3-venv nodejs npm util-linux-extra jq
 ```
 
 `gh` from GitHub's own apt repository (the archive's is too old for the worker):

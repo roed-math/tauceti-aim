@@ -82,6 +82,13 @@ def _expand(v: str | Path) -> Path:
 # (a changed path string would read as a changed worker and restart it).
 FLEET_HOME = _expand(os.environ.get("TAUCETI_FLEET_HOME") or "~/.tauceti-fleet").resolve()
 SETTINGS_FILE = FLEET_HOME / "fleet.toml"
+# Two fleets of one Unix user would otherwise share the worker manager's socket and lock (the worker's
+# runtime directory is per user) and one schedule timer. A fleet in the default home keeps the ones
+# that predate homes, so a running fleet's manager stays where it is; any other home gets its own.
+_HOME_TAG = "" if FLEET_HOME == _expand("~/.tauceti-fleet").resolve() else \
+    __import__("hashlib").sha256(str(FLEET_HOME).encode()).hexdigest()[:10]
+RUNTIME_DIR = (Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / f"tauceti-{os.getuid()}-{_HOME_TAG}"
+               if _HOME_TAG and not os.environ.get("TAUCETI_RUNTIME_DIR") else None)
 
 
 def _load_settings() -> dict:
@@ -120,7 +127,9 @@ _TARGETS_RAW = setting("fleet", "targets", "", "TAUCETI_FLEET_TARGETS")
 # and the curator has nothing to keep.
 TARGETS = None if _TARGETS_RAW.strip().lower() == "none" else _expand(_TARGETS_RAW or FLEET_HOME / "targets.md")
 EXPECT_LOGIN = setting("fleet", "github_login", env="TAUCETI_EXPECT_LOGIN")
-CLAIM_REPO = setting("fleet", "claim_repo", "TauCetiProject/tauceti-claims", "CLAIM_REPO")
+# Unset, the worker chooses: the project's shared namespace when the account has access (it accepts a
+# pending invitation), else the account's fork, which coordinates this account's fleets only.
+CLAIM_REPO = setting("fleet", "claim_repo", "", "CLAIM_REPO")
 WORKTREE = _expand(setting("paths", "worker", "~/TauCetiWorker-v2", "TAUCETI_FLEET_WORKER"))
 ROADMAP_CHECKOUT = _expand(setting("paths", "roadmap", "~/TauCetiRoadmap", "TAUCETI_FLEET_ROADMAP"))
 _SHARED_CACHE_RAW = setting("fleet", "shared_cache", "", "TAUCETI_FLEET_SHARED_CACHE")
@@ -161,8 +170,8 @@ IS_MAC = sys.platform == "darwin"
 
 sys.path.insert(0, str(WORKTREE))
 try:
-    from tauceti_worker.targets import load_targets, overlay_live, eligible_items, open_items  # noqa: E402
-    from tauceti_worker.survey import target_marker_ids  # noqa: E402
+    from tauceti_worker.targets import load_targets, overlay_live, eligible_items, open_items, partial_prs  # noqa: E402
+    from tauceti_worker.survey import partial_marker_ids, target_marker_ids  # noqa: E402
     from tauceti_worker.github import normalize_merged  # noqa: E402
 except Exception as exc:  # pragma: no cover - environment problem, say so plainly
     # Without settings, main() says "run init", which is the useful message.
@@ -185,10 +194,13 @@ def worker_env() -> dict[str, str]:
     env["PYTHONPATH"] = str(WORKTREE) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["TAUCETI_WORKERS_STATE_DIR"] = str(STATE)
     env["TAUCETI_WORKERS_CONFIG"] = str(CONFIG)
-    env["CLAIM_REPO"] = CLAIM_REPO
+    if CLAIM_REPO:
+        env["CLAIM_REPO"] = CLAIM_REPO
     env["TAUCETI_GATE_DIR"] = str(GATE_DIR)
     env["TAUCETI_GATE_REQUIRED"] = "1"
     env["TAUCETI_EXPECT_LOGIN"] = EXPECT_LOGIN
+    if RUNTIME_DIR is not None:
+        env["TAUCETI_RUNTIME_DIR"] = str(RUNTIME_DIR)
     if SHARED_CACHE:
         env["TAUCETI_SHARED_READ_CACHE"] = str(SHARED_CACHE)
         env["TAUCETI_SHARED_ATTEMPTS_DIR"] = str(SHARED_CACHE / "attempts")
@@ -247,9 +259,24 @@ def tauceti(*args: str, capture: bool = False) -> subprocess.CompletedProcess:
 # ----------------------------------------------------------------------------- fleet definition
 
 
+def gated_run(op: str, argv: list[str], kind: str = "api_read", target: str = TAUCETI,
+              timeout: int = 60) -> subprocess.CompletedProcess | None:
+    """Run one GitHub read under the fleet gate (admitted, then recorded, so it counts against the
+    workers' budgets and a halt refuses it). None when the gate refused."""
+    adm = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", kind, op, target],
+                         cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+    if adm.returncode != 0:
+        return None
+    token = adm.stdout.strip().splitlines()[-1] if adm.stdout.strip() else ""
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if r.returncode == 0 else 500)],
+                   cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+    return r
+
+
 def me() -> str:
-    p = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True)
-    return p.stdout.strip() if p.returncode == 0 else ""
+    p = gated_run("user", ["gh", "api", "user", "--jq", ".login"])
+    return p.stdout.strip() if p is not None and p.returncode == 0 else ""
 
 
 def round_timeout() -> int:
@@ -369,9 +396,10 @@ def read_leases() -> dict[str, str]:
     return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
 
 
-def assign_leases(specs: list[dict]) -> dict[str, str]:
-    """Sticky leases, one chain per worker: a worker keeps its chain while it exists and is enabled;
-    chains of workers that left the config or were disabled are released; free chains go to enabled
+def assign_leases(specs: list[dict], busy: set[str] = frozenset()) -> dict[str, str]:
+    """Sticky leases, one chain per worker: a worker keeps its chain while it exists and is enabled, or
+    while it is mid-round (`busy`: write_config keeps such a worker's old block, so it still runs on its
+    chain however the shape changed); chains of workers that left the config or were disabled are released; free chains go to enabled
     claude/auto workers without one, in config order, healthy ones first. A worker whose chain can no
     longer be renewed (chain_failing_since) moves to a healthy free chain when there is one. Workers
     left over share the operator's ~/.claude (and `tauceti-aim logins` says so). Reads the chains'
@@ -382,7 +410,7 @@ def assign_leases(specs: list[dict]) -> dict[str, str]:
     slots = {d.name for d in chains}
     failing = {d.name for d in chains if chain_failing_since(d) is not None}
     eligible = [s_["id"] for s_ in specs if s_["agent"] in ("claude", "auto") and s_["enabled"]] + [PERIODIC_WID]
-    leases = {w: slot for w, slot in read_leases().items() if w in eligible and slot in slots}
+    leases = {w: slot for w, slot in read_leases().items() if (w in eligible or w in busy) and slot in slots}
     healthy = sorted(slots - set(leases.values()) - failing)
     for wid in sorted(leases):
         if leases[wid] in failing and healthy:
@@ -431,17 +459,41 @@ def with_logins(specs: list[dict], leases: dict[str, str]) -> list[dict]:
     return specs
 
 
-def lease_logins(specs: list[dict], persist: bool = True) -> list[dict]:
-    """Assign, persist and apply the leases for these specs (the config writers call this).
-    `persist=False` (a dry run) computes them without writing. An API-billed fleet has no pool."""
+def lease_logins(specs: list[dict], persist: bool = True, busy: set[str] = frozenset()) -> list[dict]:
+    """Assign, persist and apply the leases for these specs (the config writers call this, passing the
+    workers mid-round as `busy`). `persist=False` (a dry run) computes them without writing. An
+    API-billed fleet has no pool."""
     if API:
         return specs
-    leases = assign_leases(specs)
+    leases = assign_leases(specs, busy)
     if persist:
         write_leases(leases)
         if TOKEN_FILE is not None:
             stage_setup_token()
     return with_logins(specs, leases)
+
+
+def foreground_credentials(wid: str) -> dict[str, str]:
+    """The Claude credential environment for a round the manager does not run (`round`): what a managed
+    worker gets from the reconcile. Token mode stages the token. In a pool the worker keeps its lease, or
+    takes a free chain (healthy first), persisted so the managed workers and the free-chain refresher
+    leave it alone; with none free it shares the operator's ~/.claude, as a managed worker would. A stale
+    mirror is reset, and the worker renews its own chain."""
+    if API:
+        return {}
+    leases = read_leases()
+    if TOKEN_FILE is not None:
+        if problem := stage_setup_token():
+            die(problem)
+    elif wid not in leases:
+        taken = set(leases.values())
+        chains = [d for d in login_slots() if d.name not in taken]
+        chains.sort(key=lambda d: chain_failing_since(d) is not None)
+        if chains:
+            leases[wid] = chains[0].name
+            write_leases(leases)
+    reset_stale_mirror(wid)
+    return {**claude_env(wid, leases), "TAUCETI_AUTO_REFRESH": "1"}
 
 
 def stage_setup_token() -> str | None:
@@ -622,7 +674,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
         else:
             spec["auto_refresh"] = True
         spec["env"] = {
-            "CLAIM_REPO": CLAIM_REPO,
+            **({"CLAIM_REPO": CLAIM_REPO} if CLAIM_REPO else {}),
             # Rotating a Claude access token REVOKES the old one at once (measured 2026-09-20), so a
             # worker renews only before its own agent launch, early enough that the token outlives the
             # round. That is only safe when workers do not share one login chain: see `tauceti-aim logins`.
@@ -651,7 +703,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             **({"TAUCETI_OWN_BRANCHES": OWN_BRANCHES} if OWN_BRANCHES else {}),
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
-            **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),
+            **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING is not None else {}),
             **({"TAUCETI_FALLBACK_AUTO": "1", "TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_AUTO_MIN)}
                if FALLBACK_AUTO else {}),
             **LOOKAHEAD_ENV,
@@ -1407,11 +1459,12 @@ class Progress:
             targets = load_targets(TARGETS) if TARGETS is not None else None
             login = me()
             base = ["gh", "pr", "list", "--repo", TAUCETI, "--limit", "200", "--json"]
-            op = subprocess.run(base + ["number,body,labels,createdAt,author", "--state", "open"], capture_output=True, text=True, timeout=60)
+            refused = subprocess.CompletedProcess([], 1, "", "the gate refused the read")
+            op = gated_run("pr-list", base + ["number,body,labels,createdAt,author", "--state", "open"]) or refused
             # Bors merges are CLOSED to GitHub (see normalize_merged): list closed PRs by search, where
             # `closed` covers merged ones too, and keep the merges of either kind.
-            mp = subprocess.run(base + ["number,body,mergedAt,closedAt,author,state,title", "--state", "closed",
-                                        "--search", "sort:updated-desc"], capture_output=True, text=True, timeout=60)
+            mp = gated_run("pr-list", base + ["number,body,mergedAt,closedAt,author,state,title", "--state", "closed",
+                                               "--search", "sort:updated-desc"]) or refused
             open_prs = json.loads(op.stdout or "[]") if op.returncode == 0 else []
             merged = [p for p in map(normalize_merged, json.loads(mp.stdout or "[]") if mp.returncode == 0 else [])
                       if p.get("state") == "MERGED"]
@@ -1420,8 +1473,13 @@ class Progress:
             inflight, done = set(), set()
             for p in open_prs:
                 inflight.update(target_marker_ids(p.get("body") or ""))
+            # The curator's rule: a merge completes an item only when its marker is not partial and the
+            # item does not record that PR as partial.
+            recorded = {(a, it.slug): partial_prs(it) for a, items in targets.areas.items() for it in items} if targets else {}
             for p in merged:
-                done.update(target_marker_ids(p.get("body") or ""))
+                body = p.get("body") or ""
+                done.update(k for k in set(target_marker_ids(body)) - partial_marker_ids(body)
+                            if p.get("number") not in recorded.get(k, ()))
             listed = {(a, it.slug) for a, items in targets.areas.items() for it in items} if targets else set()
             live = overlay_live(targets, inflight & listed, done & listed) if targets else None
             day_ago = (datetime.now(timezone.utc).timestamp() - 86400)
@@ -1453,8 +1511,11 @@ class Progress:
                 mine_open=len(mine_open),
                 open_total=len(open_prs),
             )
-            lr = subprocess.run(["git", "ls-remote", f"https://github.com/{CLAIM_REPO}", "refs/tauceti-claims/author/*"], capture_output=True, text=True, timeout=60)
-            d["claims"] = [line.split("refs/tauceti-claims/author/", 1)[1] for line in lr.stdout.splitlines() if "refs/tauceti-claims/author/" in line]
+            url = f"https://github.com/{CLAIM_REPO}" if CLAIM_REPO else ""
+            lr = gated_run("ls-remote", ["git", "ls-remote", url, "refs/tauceti-claims/author/*"], kind="git_read",
+                           target=url) if url else None
+            d["claims"] = [line.split("refs/tauceti-claims/author/", 1)[1] for line in (lr.stdout if lr else "").splitlines()
+                           if "refs/tauceti-claims/author/" in line]
         except Exception as exc:  # keep the view alive on any hiccup
             d["error"] = str(exc)[:80]
         self.data = d
@@ -2106,8 +2167,9 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
             "--author-effort", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_EFFORT", "high"),
             "--agent", "claude", *(["--roadmap-targets", str(TARGETS)] if TARGETS is not None else []), *api_flags()]
     # The lock file descriptor is inherited by the child, so the lock lives as long as the round.
-    subprocess.Popen(argv, cwd=WORKTREE, env=periodic_env(), stdout=open(log, "a"), stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(lock.fileno(),))
+    child = subprocess.Popen(argv, cwd=WORKTREE, env=periodic_env(), stdout=open(log, "a"), stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(lock.fileno(),))
+    (periodic_dir() / "run.pid").write_text(f"{child.pid}\n")
     note = f"periodic: started a {stage} round → {log}"
     _watchdog_note(note)
     if not quiet:
@@ -2115,9 +2177,29 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
     return note
 
 
+def stop_periodic() -> str | None:
+    """End the periodic round in flight, if any (its own session, so its whole process group)."""
+    import signal
+
+    try:
+        pid = int((periodic_dir() / "run.pid").read_text().strip())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes() if Path("/proc").is_dir() else \
+            subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True).stdout
+    except (OSError, ValueError):
+        return None
+    if b"tauceti_worker" not in cmdline:
+        return None  # finished, and the pid reused
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        return None
+    return f"periodic: stopped the round in flight (pid {pid})"
+
+
 def ensure_periodic(quiet: bool) -> None:
-    """Called from the reconcile hook and the live view: start whichever periodic stage is due."""
-    if draining():
+    """Called from the reconcile hook and the live view: start whichever periodic stage is due, while the
+    fleet runs (not draining, not stopped by `down`, its manager up). `periodic --now` is the owner's."""
+    if draining() or STOPPED.is_file() or not manager_alive():
         return
     for stage in PERIODIC:
         note = run_periodic(stage, quiet=quiet)
@@ -2139,7 +2221,7 @@ def periodic_status(stage: str) -> dict:
         except OSError:
             pass
     try:
-        running = subprocess.run(["pgrep", "-f", f"--only {stage} --worker-id {PERIODIC_WID}"],
+        running = subprocess.run(["pgrep", "-f", "--", f"--only {stage} --worker-id {PERIODIC_WID}"],
                                  capture_output=True, text=True, timeout=5).returncode == 0
     except (OSError, subprocess.SubprocessError):
         running = False
@@ -2203,64 +2285,50 @@ def cmd_periodic(a: argparse.Namespace) -> int:
 
 
 def cmd_targets(a: argparse.Namespace) -> int:
-    """Audit the target list's `[~]` items against their PRs. The file marks an item in flight by
-    hand ("in flight: #N"); the live view promotes it to done only when a MERGED PR carries its
-    marker, and nothing ever demotes it, so an item whose PR was CLOSED stays in flight forever and
-    every item that needs it stays ineligible. 2026-09-21: 16 of 20 in-flight PRs had been closed
-    as subsumed by main, 0 of 88 open items were eligible, and the author idled at the backoff cap.
-    Prints a suggestion per item; --apply rewrites the confident ones (merged → done; closed with a
-    recorded subsumed-by verdict → done, naming the upstream PR) and leaves the rest for the owner."""
+    """Audit the target list's `[~]` items against their PRs, with the worker's own rule (targets.
+    sync_inflight, the curator's): a merged PR completes its item only when it carries the item's marker
+    without `"partial": true` and the item does not already record it as partial; a merged PR without
+    the item's marker is left for the curator, which checks main; a closed PR with a recorded
+    subsumed-by verdict completes it; any other closed PR is the owner's. 2026-09-21: 16 of 20 in-flight
+    PRs had been closed as subsumed, and nothing ever demoted them. Prints the changes; --apply writes them."""
+    from tauceti_worker.targets import inflight_prs, sync_inflight
+
     if TARGETS is None:
         die("this fleet has no target list (fleet.targets = \"none\")")
-    text = TARGETS.read_text()
     verdicts = _verdicts()
-    rows, edits = [], {}
-    area = None
-    for line in text.splitlines():
-        if line.startswith("## "):
-            area = line[3:].strip()
+    states: dict[int, str] = {}
+    partial: dict[int, str] = {}
+    unread, unmarked = [], []
+    for area, it, pr in inflight_prs(load_targets(TARGETS)):
+        d = _gated_pr_view(pr, "state,body")
+        if not d or not d.get("state"):
+            unread.append(f"`{it.slug}` #{pr}")
             continue
-        m = re.match(r"- \[~\] `([^`]+)`.*?in flight: #(\d+)", line)
-        if not m:
-            continue
-        slug, pr = m.group(1), int(m.group(2))
-        d = _gated_pr_view(pr, "state,mergedAt")
-        state = (d or {}).get("state", "?")
-        v = verdicts.get(pr) or {}
-        by = list(v.get("subsumed_by") or []) or list(v.get("mentions") or [])
-        words = " ".join(str(v.get("summary") or "").split()).lower()
-        subsumed = bool(v) and ("subsum" in words or bool(v.get("subsumed_by")))
-        if state == "MERGED":
-            verdict, new = "landed", line.replace("- [~]", "- [x]", 1).replace(f"in flight: #{pr}", f"landed: #{pr}")
-        elif state == "CLOSED" and subsumed:
-            up = ", ".join(f"#{n}" for n in by) or "upstream (unnamed)"
-            verdict = f"closed, subsumed by {up}"
-            new = line.replace("- [~]", "- [x]", 1).replace(f"in flight: #{pr}", f"subsumed by: {up}; closed: #{pr}")
-        elif state == "CLOSED":
-            verdict, new = "closed, no subsumption verdict on record — owner decides ([ ] to re-author, [x] if done)", None
-        elif state == "OPEN":
-            verdict, new = "open, still in flight", None
-        else:
-            verdict, new = "state unknown (read refused?)", None
-        rows.append((area, slug, pr, state, verdict))
-        if new:
-            edits[line] = new
-    width = max((len(r[1]) for r in rows), default=10)
-    for area, slug, pr, state, verdict in rows:
-        print(f"{area:24s} {slug:{width}s} #{pr} {state:7s} → {verdict}")
-    print(f"\n{len(edits)} of {len(rows)} in-flight item(s) would be marked done" + ("" if a.apply else " (pass --apply)"))
+        body = d.get("body") or ""
+        if d["state"] == "MERGED":
+            if (area, it.slug) in partial_marker_ids(body) or pr in partial_prs(it):
+                partial[pr] = "its marker says partial"
+            elif (area, it.slug) not in target_marker_ids(body):
+                unmarked.append(f"`{it.slug}` #{pr}")
+                continue
+        states[pr] = d["state"]
+    text = TARGETS.read_text()
+    new_text, changes = sync_inflight(text, states, verdicts, partial)
+    for line in changes:
+        print(line)
+    for what, items in (("merged without the item's marker (the curator checks main)", unmarked),
+                        ("not read (the gate refused?)", unread)):
+        if items:
+            print(f"left as is, {what}: " + ", ".join(items))
+    edits = sum(1 for x, y in zip(text.splitlines(), new_text.splitlines()) if x != y)
+    print(f"\n{edits} line(s) would change" + ("" if a.apply else " (pass --apply)"))
     if a.apply and edits:
-        # Under the list's lock, against the list as it is now: the PR reads above took a while, and
-        # a curator (this fleet's or another's sharing the file) may have written it meanwhile.
+        # Under the list's lock, against the list as it is now: the PR reads above took a while, and a
+        # curator (this fleet's or another's sharing the file) may have written it meanwhile.
         with targets_lock():
-            text = TARGETS.read_text()
-            done = [old for old in edits if old in text]
-            for old in done:
-                text = text.replace(old, edits[old], 1)
+            text, _ = sync_inflight(TARGETS.read_text(), states, verdicts, partial)
             TARGETS.write_text(text)
-        rest = len(edits) - len(done)
-        print(f"applied {len(done)} to {TARGETS}" + (f"; {rest} line(s) had changed meanwhile and were left" if rest else "")
-              + " — review the diff and commit it")
+        print(f"applied to {TARGETS} — review the diff and commit it")
     return 0
 
 
@@ -2818,15 +2886,7 @@ def view_data(progress: Progress) -> dict:
         specs_ids = re.findall(r'^id\s*=\s*"([^"]+)"', CONFIG.read_text(), re.M)
     ids = specs_ids or sorted(statuses)
     free_gb = shutil.disk_usage(HOME).free / 2**30
-    # The manager advertises itself on a Unix socket in the worker's runtime dir, which depends on the
-    # environment the manager was STARTED in ($TAUCETI_RUNTIME_DIR, else $XDG_RUNTIME_DIR/tauceti, else
-    # /tmp/tauceti-<uid>). A watch shell may differ, so look in every place it could be.
-    uid = os.getuid()
-    candidates = [Path(os.environ["TAUCETI_RUNTIME_DIR"]).expanduser()] if os.environ.get("TAUCETI_RUNTIME_DIR") else []
-    if os.environ.get("XDG_RUNTIME_DIR"):
-        candidates.append(Path(os.environ["XDG_RUNTIME_DIR"]) / "tauceti")
-    candidates += [Path(f"/run/user/{uid}/tauceti"), Path(f"/tmp/tauceti-{uid}")]
-    mgr_alive = any((c / "manager.sock").exists() for c in candidates)
+    mgr_alive = manager_alive()
     _off = set(re.findall(r'^id\s*=\s*"([^"]+)"\s*\nenabled\s*=\s*false', CONFIG.read_text() if CONFIG.is_file() else "", re.M))
     enabled_ids = [w for w in ids if w not in _off]  # disabled workers are neither healthy nor unhealthy
     healthy = sum(1 for w in enabled_ids if health(statuses.get(w, {}))[1] == "green")
@@ -3182,13 +3242,46 @@ def pace_step(state: dict, *, now: float, B: float, H: float, R: float | None, f
     return out
 
 
-def manager_alive() -> bool:
+def manager_runtime_dirs() -> list[Path]:
+    """Where this fleet's manager may have its socket: the worker's own search order."""
+    if RUNTIME_DIR is not None:
+        return [RUNTIME_DIR]
     uid = os.getuid()
     candidates = [Path(os.environ["TAUCETI_RUNTIME_DIR"]).expanduser()] if os.environ.get("TAUCETI_RUNTIME_DIR") else []
     if os.environ.get("XDG_RUNTIME_DIR"):
         candidates.append(Path(os.environ["XDG_RUNTIME_DIR"]) / "tauceti")
-    candidates += [Path(f"/run/user/{uid}/tauceti"), Path(f"/tmp/tauceti-{uid}")]
-    return any((c / "manager.sock").exists() for c in candidates)
+    return candidates + [Path(f"/run/user/{uid}/tauceti"), Path(f"/tmp/tauceti-{uid}")]
+
+
+def manager_ping() -> dict | None:
+    """The answer of the manager on this user's socket (the worker's `ping`: pid and config), or None
+    when nothing answers. A socket file left by a manager that died answers nothing."""
+    import socket
+
+    for d in manager_runtime_dirs():
+        sock = d / "manager.sock"
+        if not sock.exists():
+            continue
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(1.0)
+        try:
+            client.connect(str(sock))
+            client.sendall(b'{"action": "ping"}\n')
+            data = client.recv(65536)
+            reply = json.loads(data.split(b"\n", 1)[0]) if data else None
+            if isinstance(reply, dict) and reply.get("ok"):
+                return reply
+        except (OSError, ValueError):
+            continue
+        finally:
+            client.close()
+    return None
+
+
+def manager_alive() -> bool:
+    """This fleet's manager answers (not merely: a socket file exists, nor: another fleet's answers)."""
+    reply = manager_ping()
+    return bool(reply) and Path(str(reply.get("config") or "")).expanduser().resolve() == CONFIG.resolve()
 
 
 def budget_pace(force: bool = False) -> dict | None:
@@ -3299,7 +3392,7 @@ def reset_due_incident(left: float, extra: float, R: float | None) -> None:
 def budget_line() -> str | None:
     """The view's `budget` row: the last controller step, or the fixed cap."""
     if not FALLBACK_AUTO:
-        return f"outside-list cap {FALLBACK_MAX_OPEN_SETTING} (fixed)" if FALLBACK_MAX_OPEN_SETTING else None
+        return f"outside-list cap {FALLBACK_MAX_OPEN_SETTING} (fixed)" if FALLBACK_MAX_OPEN_SETTING is not None else None
     st = read_json(FALLBACK_CAP) if FALLBACK_CAP.is_file() else {}
     if not st.get("at"):
         return "outside-list cap: budget-paced, no step yet"
@@ -3621,7 +3714,8 @@ def cmd_up(a: argparse.Namespace) -> int:
         text, _style = api_budget_text(api_budget())
         print(text)
     a.authors_enabled = True
-    specs = lease_logins(fleet_specs(a), persist=not a.dry_run)
+    statuses = worker_status()
+    specs = lease_logins(fleet_specs(a), persist=not a.dry_run, busy=busy_workers(statuses))
     for text, style in credential_lines():
         print(f"creds: {text}")
     if any(s["agent"] == "codex" for s in specs) and shutil.which("codex") is None:
@@ -3632,7 +3726,6 @@ def cmd_up(a: argparse.Namespace) -> int:
     # A dry run validates a separate file: writing the live one would leave it changed but never
     # applied, and the next reconcile would then see nothing to apply.
     target = FLEET_HOME / "workers.dry-run.toml" if a.dry_run else CONFIG
-    statuses = worker_status()
     changed, switched, deferred = write_config(specs, statuses, path=target)
     if not a.dry_run:
         for note in reset_stale_mirrors([s_["id"] for s_ in specs if s_["id"] not in deferred], statuses):
@@ -3668,6 +3761,12 @@ def cmd_up(a: argparse.Namespace) -> int:
     return cmd_watch(a)
 
 
+def busy_workers(statuses: dict[str, dict], hook_wid: str | None = None) -> set[str]:
+    """The workers write_config must leave on their current block: mid-round, except the one whose own
+    round-done hook is running (its status still reads "running" at that instant)."""
+    return {w for w, st in statuses.items() if w != hook_wid and mid_round(st)}
+
+
 def write_config(specs: list[dict], statuses: dict[str, dict] | None = None,
                  hook_wid: str | None = None, write: bool = True,
                  path: Path | None = None) -> tuple[bool, list[str], list[str]]:
@@ -3685,7 +3784,7 @@ def write_config(specs: list[dict], statuses: dict[str, dict] | None = None,
     for wid in list(new) + [w for w in old if w not in new]:
         blk = new.get(wid)
         if wid in old and old[wid] != blk:
-            if statuses is not None and wid != hook_wid and mid_round(statuses.get(wid, {})):
+            if statuses is not None and wid in busy_workers(statuses, hook_wid):
                 blk, _ = old[wid], deferred.append(wid)
             else:
                 switched.append(wid)
@@ -3841,8 +3940,8 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
         dry = bool(getattr(a, "dry_run", False))
         if not dry:
             merge_attempts_into_shared(quiet)
-        specs = lease_logins(fleet_specs(a), persist=not dry)
         statuses, hook_wid = worker_status(), os.environ.get("TAUCETI_ROUND_WID")
+        specs = lease_logins(fleet_specs(a), persist=not dry, busy=busy_workers(statuses, hook_wid))
         changed, switched, deferred = write_config(specs, statuses, hook_wid, write=not dry)
         if dry:
             for wid in switched:
@@ -3946,8 +4045,11 @@ def cmd_round(a: argparse.Namespace) -> int:
     a.worker_id = a.worker_id or wid("c", 1)
     if a.sandbox == "bubble" and shutil.which("bubble") is None:
         die("bubble is not on PATH")
+    if mid_round(worker_status().get(a.worker_id, {})):
+        die(f"{a.worker_id} is running under the manager: give this round another --worker-id")
     GATE_DIR.mkdir(parents=True, exist_ok=True)
     env = worker_env()
+    env.update(foreground_credentials(a.worker_id))
     env.update({
         "TAUCETI_GATE_MUTATIONS_PER_HOUR": str(a.mutations_per_hour),
         "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
@@ -3957,11 +4059,10 @@ def cmd_round(a: argparse.Namespace) -> int:
     })
     if API:
         env.pop("TAUCETI_PACE", None)
+    model, effort = (a.claude_model, a.claude_effort) if a.agent == "claude" else (a.codex_model, a.codex_effort)
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", a.only, "--agent", a.agent, "--worker-id", a.worker_id,
             *(["--roadmap-targets", str(TARGETS)] if TARGETS is not None else []), *api_flags(),
-            "--author-model", a.claude_model if a.agent == "claude" else a.codex_model or "",
-            "--author-effort", a.claude_effort if a.agent == "claude" else a.codex_effort or ""]
-    argv = [x for x in argv if x != ""]
+            *(["--author-model", model] if model else []), *(["--author-effort", effort] if effort else [])]
     if a.sandbox == "bubble":
         argv.append("--bubble")
     print("round:", " ".join(argv[2:]))
@@ -4547,7 +4648,7 @@ SCHEDULE_STATE = FLEET_HOME / "schedule.state"
 # (`attention --ack schedule`). The tick retries every minute, so one record holds the first failure.
 START_FAILED = INCIDENTS / "schedule-start.json"
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-SCHEDULE_UNIT = "tauceti-fleet-schedule"
+SCHEDULE_UNIT = f"tauceti-fleet-schedule-{_HOME_TAG}" if _HOME_TAG else "tauceti-fleet-schedule"
 
 
 def parse_schedule(spec: str) -> list[tuple[int, int]]:
@@ -4699,6 +4800,20 @@ def _schedule_unit(install: bool) -> int:
     return rc
 
 
+def cmd_clear_halt(a: argparse.Namespace) -> int:
+    """Print and clear this fleet's identity halts through the worker's own `--clear-halt`, which also
+    returns the fleet gate to RUNNING (deleting halt.json alone left the gate HALTED_MANUAL, so the next
+    start was refused). Only this fleet's workers: other fleets may share the worker checkout."""
+    ids = list(parse_blocks(CONFIG.read_text()) if CONFIG.is_file() else {}) + [PERIODIC_WID]
+    halted = [w for w in ids if (WORKTREE / "state" / w / "halt.json").is_file()]
+    for w in halted:
+        print(f"== {w}\n{(WORKTREE / 'state' / w / 'halt.json').read_text()}")
+    rc = 0
+    for w in halted or ids[:1]:  # with no worker halted, one call still clears the gate's own halt
+        rc |= tauceti("work", "--clear-halt", "--worker-id", w).returncode
+    return rc
+
+
 def cmd_down(a: argparse.Namespace) -> int:
     if getattr(a, "drain", False):
         if not CONFIG.is_file():
@@ -4707,11 +4822,17 @@ def cmd_down(a: argparse.Namespace) -> int:
         DRAINING.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n")
         print("draining: each worker stops when its current round ends; `tauceti-aim up` starts the fleet again")
         return drain_step(quiet=False)
+    reply = manager_ping()
+    if reply and Path(str(reply.get("config") or "")).expanduser().resolve() != CONFIG.resolve():
+        die(f"the manager on this user's socket runs {reply.get('config')}, not this fleet's {CONFIG}: "
+            "refusing to stop another fleet (set TAUCETI_FLEET_HOME to that fleet's home)")
     args = ["workers", "--config", str(CONFIG), "manager-stop"]
     if a.leave_workers:
         args.append("--leave-workers")
     FLEET_HOME.mkdir(parents=True, exist_ok=True)
     STOPPED.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    if not a.leave_workers and (note := stop_periodic()):
+        print(note)
     return tauceti(*args).returncode
 
 
@@ -4786,8 +4907,10 @@ name = {name}
 targets = {targets}
 # The GitHub account every worker must act as; a worker halts on any other identity.
 github_login = {login}
-# The claim namespace shared by every worker of the project (all fleets must agree on it).
-claim_repo = "TauCetiProject/tauceti-claims"
+# The claim namespace. Unset, each worker chooses: the project's shared namespace when this account has
+# access (it accepts a pending invitation), else the account's own fork, which coordinates only this
+# account's fleets. Set it to insist on one; every fleet that must coordinate has to agree on it.
+# claim_repo = "TauCetiProject/tauceti-claims"
 
 [paths]
 worker = {worker}      # a TauCetiWorker checkout (see README.md for the branch)
@@ -4954,7 +5077,7 @@ def main() -> int:
     pb = sub.add_parser("publish", help="write this fleet's view to fleet.status_dir now (rounds and the timer do it anyway)")
     pb.set_defaults(fn=cmd_publish)
     ch = sub.add_parser("clear-halt", help="print each worker's halt incident, then clear it (owner action)")
-    ch.set_defaults(fn=lambda a: [print(f"== {h.parent.name}\n{h.read_text()}") or h.unlink() for h in sorted((WORKTREE / "state").glob("*/halt.json"))] and 0 or 0)
+    ch.set_defaults(fn=cmd_clear_halt)
     gt = sub.add_parser("gate", help="pass-through to `tauceti gate ...` (status, report, resume, halt)")
     gt.add_argument("args", nargs=argparse.REMAINDER)
     gt.set_defaults(fn=lambda a: tauceti("gate", *a.args).returncode)
