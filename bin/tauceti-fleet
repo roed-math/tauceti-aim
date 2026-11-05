@@ -1590,6 +1590,106 @@ def pending_decide() -> int:
     return sum(1 for p in INCIDENTS.glob("declined-*.json") if awaiting_decide(read_json(p))) if INCIDENTS.is_dir() else 0
 
 
+def _iso_ts(s) -> float | None:
+    try:
+        return datetime.strptime(str(s or ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _overtaken(d: dict, view: dict | None, branches: dict | None, listed_at: float,
+               active: bool | None) -> tuple[str, str]:
+    """(cause, note) when the facts have overtaken a live item, else ("", ""). `view` is its PR as read now, `branches` the
+    lookahead listing by (area, slug) as of `listed_at`, `active` whether the fleet is in its slot."""
+    kind, pr = d.get("kind"), d.get("pr")
+    if isinstance(pr, int) and pr > 0 and view:
+        state = str(view.get("state") or "")
+        if state in ("MERGED", "CLOSED"):
+            return state.lower(), f"#{pr} is {state.lower()}"
+        head, was = str(view.get("headRefOid") or ""), str(d.get("head") or "")
+        # A decline or a spent budget is about one head; a progress report's head is the gate's to move.
+        if kind in ("budget-spent", "declined") and head and was and not head.startswith(was[:12]):
+            return "new head", f"#{pr} moved to {head[:12]}"
+        labels = {lb.get("name") for lb in view.get("labels") or [] if isinstance(lb, dict)}
+        if kind == "budget-spent" and "ready-to-merge" in labels:
+            return "ready to merge", f"#{pr} is ready to merge"
+    if kind == "lookahead" and branches is not None:
+        area, _, slug = str(d.get("target") or "").partition("/")
+        row = branches.get((area, slug))
+        last = _iso_ts(d.get("last_at"))
+        if row is None:
+            return ("branch gone", f"{d.get('branch')} is gone") if last and listed_at > last else ("", "")
+        if d.get("what") == "unreadable" and row.get("status") != "unknown":
+            return "branch reads", f"{d.get('branch')} reads as {row.get('status')} at {str(row.get('sha'))[:12]}"
+        if last and (row.get("built_at") or 0) > last:
+            return "branch pushed", f"{d.get('branch')} was pushed since, at {str(row.get('sha'))[:12]}"
+    if kind in ("budget-short", "budget-reset") and active is False:
+        return "slot ended", "the fleet's slot ended"
+    return "", ""
+
+
+def sweep_attention(quiet: bool = True) -> list[str]:
+    """Archive the live items the facts have overtaken, with no model and from any fleet state: the PR
+    merged or closed, a spent budget's head moved or went ready to merge, a lookahead branch read or was
+    pushed since, a budget warning outlived its slot. One gated read per PR named; lookahead and budget
+    items use local data only. Archived items carry `resolved_note` and show as cleared, not acknowledged.
+    The decide stage does the same for the declines it rules on, but only in the fleet's slot."""
+    import fcntl
+
+    if not INCIDENTS.is_dir():
+        return []
+    with open(INCIDENTS / ".sweep.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return []  # another sweep is running
+        return _sweep(quiet)
+
+
+def _sweep(quiet: bool) -> list[str]:
+    live = [(p, read_json(p)) for p in sorted(INCIDENTS.glob("*.json"))]
+    live = [(p, d) for p, d in live if d.get("kind") and d.get("kind") != "targets-updated" and not awaiting_decide(d)]
+    views: dict[tuple[str, int], dict | None] = {}
+    for _p, d in live:
+        pr = d.get("pr")
+        key = (str(d.get("repo") or TAUCETI), pr)
+        if isinstance(pr, int) and pr > 0 and key not in views:
+            views[key] = _gated_pr_view(pr, "state,headRefOid,labels", repo=key[0])
+    snap = read_json(LOOKAHEAD_DIR / "branches.json")
+    branches = None
+    if snap.get("branches") is not None:
+        branches = {(r.get("area"), r.get("slug")): r for r in snap["branches"]}
+    active = schedule_info().get("active_now")
+    out = []
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for p, d in live:
+        cause, why = _overtaken(d, views.get((str(d.get("repo") or TAUCETI), d.get("pr"))), branches,
+                                snap.get("at") or 0, active)
+        if not cause:
+            continue
+        d.pop("_path", None)
+        d.update(resolved_at=now, resolved_cause=cause, resolved_note=why)
+        try:
+            ACKED.mkdir(parents=True, exist_ok=True)
+            (ACKED / p.name).write_text(json.dumps(d, indent=1) + "\n")
+            p.unlink()
+        except OSError:
+            continue
+        line = f"{p.stem}: cleared ({why})"
+        out.append(line)
+        if not quiet:
+            print(line)
+    return out
+
+
+def recent_clears(hours: int = 24) -> list[dict]:
+    """Items sweep_attention archived in the last `hours`, newest first."""
+    cutoff = time.time() - hours * 3600
+    out = [d for p in (ACKED.glob("*.json") if ACKED.is_dir() else []) for d in [read_json(p)]
+           if (_iso_ts(d.get("resolved_at")) or 0) >= cutoff]
+    return sorted(out, key=lambda d: str(d.get("resolved_at")), reverse=True)
+
+
 def targets_undecided() -> list[tuple[str, str]]:
     """The curator's open questions that are still open: from its newest record (live or archived),
     the notes whose item is still in the state the curator asked about. A closed-PR question lasts
@@ -1625,6 +1725,23 @@ def targets_undecided() -> list[tuple[str, str]]:
         if still:
             out.append((str(newest.get("last_at") or ""), str(note)))
     return out
+
+
+def attention_id(d: dict) -> str:
+    """What an item is about, the same on every fleet: `repo#N` for a PR, else its key."""
+    if isinstance(d.get("pr"), int) and d["pr"] > 0:
+        return f"{d.get('repo') or TAUCETI}#{d['pr']}"
+    return f"{d.get('kind')}:{d.get('key')}"
+
+
+def attention_cause(d: dict) -> str:
+    """The short cause an item is grouped under in the view of all fleets."""
+    kind = d.get("kind")
+    if d.get("decision"):
+        return f"{d['decision']} ruling"
+    return {"budget-spent": "attempts spent", "declined": "declined", "lookahead": f"lookahead {d.get('what') or ''}".strip(),
+            "progress-stuck": "report stuck", "targets-undecided": "target question", "login": "sign-in",
+            "review-stuck": "review stuck"}.get(kind, str(kind))
 
 
 def attention_line(d: dict, width: int = 150) -> str:
@@ -1672,16 +1789,16 @@ def lookup_prs(numbers: list[int]) -> dict[int, str]:
     return out
 
 
-def _gated_pr_view(n: int, fields: str) -> dict | None:
+def _gated_pr_view(n: int, fields: str, repo: str = TAUCETI) -> dict | None:
     """One gated read of a PR (the fleet's budget), or None when refused or failed."""
-    p = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", "api_read", "pr-view", TAUCETI],
+    p = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", "api_read", "pr-view", repo],
                        cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
     if p.returncode != 0:
         return None
     token = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
     want = fields.split(",")
     want += [f for f, need in (("title", "state"), ("closedAt", "mergedAt")) if need in want and f not in want]
-    q = subprocess.run(["gh", "pr", "view", str(n), "--repo", TAUCETI, "--json", ",".join(want)],
+    q = subprocess.run(["gh", "pr", "view", str(n), "--repo", repo, "--json", ",".join(want)],
                        capture_output=True, text=True, timeout=60)
     subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if q.returncode == 0 else 500)],
                    cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
@@ -2343,6 +2460,9 @@ def cmd_attention(a: argparse.Namespace) -> int:
         return _roadmap_change("open", pr)
     if getattr(a, "show_roadmap", None):
         return _roadmap_change("show", a.show_roadmap)
+    if getattr(a, "sweep", False):
+        print(f"cleared {len(sweep_attention(quiet=False))} item(s)")
+        return 0
     if getattr(a, "open_roadmap", None):
         rc = _roadmap_change("show", a.open_roadmap)
         return rc if rc != 0 else _roadmap_change("open", a.open_roadmap)
@@ -2384,6 +2504,12 @@ def cmd_attention(a: argparse.Namespace) -> int:
         for d in recent:
             what = d.get("roadmap_pr") or ", ".join(d.get("close_evidence") or []) or d.get("decision_note") or ""
             print(f"   #{d.get('pr') or '-'} {d['decision']:9s} {str(d.get('decided_at'))[5:16]}  {' '.join(str(what).split())[:120]}")
+        print()
+    cleared = recent_clears()
+    if cleared:
+        print("Cleared by itself in the last 24 h (the facts overtook it):")
+        for d in cleared:
+            print(f"   {'#' + str(d['pr']) if d.get('pr') else d.get('key') or '-'} {d.get('kind')}  {str(d.get('resolved_at'))[5:16]}  {d.get('resolved_note')}")
         print()
     if not items:
         print("nothing needs you.")
@@ -2741,6 +2867,7 @@ def view_data(progress: Progress) -> dict:
     items = attention_items()
     needs = [[attention_line(it, 140), "bold red" if it.get("close_hint") or it.get("kind") == "schedule-start" else "yellow"]
              for it in items]
+    needs_ids = [[attention_id(it), attention_cause(it)] for it in items]
     hint = "tauceti-fleet attention for the full text; --ack <PR> once handled"
     if any(it.get("decision") == "roadmap" for it in items):
         hint += "; --file-roadmap <PR> to file a drafted roadmap change"
@@ -2756,6 +2883,14 @@ def view_data(progress: Progress) -> dict:
         if closed:
             parts.append("closed " + " ".join(closed))
         after.append([_cell("decide"), _cell(Text("; ".join(parts), style="bold" if closed else "dim", overflow="fold"))])
+    cleared = recent_clears()
+    if cleared:
+        why: dict[str, int] = {}
+        for d in cleared:
+            why[d.get("resolved_cause") or "?"] = why.get(d.get("resolved_cause") or "?", 0) + 1
+        after.append([_cell("cleared"), _cell(Text(f"24 h: {len(cleared)} item(s) the facts overtook ("
+                                                   + ", ".join(f"{n} {k}" for k, n in sorted(why.items(), key=lambda x: -x[1]))
+                                                   + ")", style="dim", overflow="fold"))])
     if not progress.creds or time.time() - getattr(progress, "creds_at", 0) > 300:
         progress.creds = cached_credential_lines()
         progress.creds_at = time.time()
@@ -2767,7 +2902,7 @@ def view_data(progress: Progress) -> dict:
     return {"v": 1, "fleet": NAME, "user": _pwd.getpwuid(os.getuid()).pw_name, "at": time.time(),
             "targets": TARGETS.name if TARGETS is not None else "none", "manager_up": mgr_alive, "draining": draining(), "disk_free_gb": free_gb,
             "healthy": healthy, "enabled": len(enabled_ids), "total": len(ids), "workers": workers,
-            "rows": rows, "needs": needs, "needs_hint": hint, "rows_after": after,
+            "rows": rows, "needs": needs, "needs_ids": needs_ids, "needs_hint": hint, "rows_after": after,
             "events": [list(e) for e in recent_events(40)], "schedule": schedule_info()}
 
 
@@ -3229,8 +3364,24 @@ def render_fleets(snaps: list[dict], d: Path, console=None):
     strip = Table.grid(padding=(0, 2))
     for _ in range(5):
         strip.add_column()
+    # One row per thing that needs the owner, however many fleets filed it, grouped by cause.
+    grouped: dict[str, dict] = {}
+    for s in snaps:
+        ids = s.get("needs_ids") or []
+        for i, (line, lstyle) in enumerate(s.get("needs") or []):
+            ident, cause = ids[i] if i < len(ids) else (f"{s['fleet']}:{i}", "other")
+            g = grouped.setdefault(ident, {"line": line, "style": lstyle, "cause": cause, "fleets": []})
+            g["fleets"].append(s["fleet"])
+    causes: dict[str, int] = {}
+    for g in grouped.values():
+        causes[g["cause"]] = causes.get(g["cause"], 0) + 1
     needs_all = Text()
-    n_needs = 0
+    for g in sorted(grouped.values(), key=lambda g: (-causes[g["cause"]], g["cause"])):
+        if needs_all:
+            needs_all.append("\n")
+        needs_all.append(",".join(g["fleets"]) + ": ", style="bold")
+        needs_all.append(g["line"], style=g["style"])
+    n_needs = len(grouped)
     for s in snaps:
         state, style = _fleet_state(s)
         stale = time.time() - (s.get("at") or 0)
@@ -3241,16 +3392,11 @@ def render_fleets(snaps: list[dict], d: Path, console=None):
                            style="dim"),
                       Text(f"needs you {n}" if n else "nothing needs you", style="bold red" if n else "dim")
                       + Text(f"   snapshot {age(s.get('at'))} old", style="red" if stale > 900 else "dim"))
-        for line, lstyle in s.get("needs") or []:
-            if n_needs:
-                needs_all.append("\n")
-            needs_all.append(f"{s['fleet']}: ", style="bold")
-            needs_all.append(line, style=lstyle)
-            n_needs += 1
     above = [Panel(strip, title=f"fleets ({d})", border_style="magenta")]
     if n_needs:
         needs_all.append("\n(as each fleet's user: tauceti-fleet attention for the full text; --ack <PR> once handled)", style="dim")
-        above.append(Panel(needs_all, title=f"needs you, all fleets ({n_needs})", border_style="red"))
+        by_cause = ", ".join(f"{n} {c}" for c, n in sorted(causes.items(), key=lambda x: -x[1]))
+        above.append(Panel(needs_all, title=f"needs you, all fleets ({n_needs}: {by_cause})", border_style="red"))
     return render_view(main, console, needs=False, above=above)
 
 
@@ -3331,6 +3477,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
                     try:
                         freshen_logins(quiet=True)
                         login_incidents()
+                        sweep_attention()
                         ensure_periodic(quiet=True)
                         ensure_auth_proxy_alive(quiet=True)
                     except Exception as exc:
@@ -3645,6 +3792,7 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
         if not dry:
             freshen_logins(quiet)
             login_incidents()
+            sweep_attention(quiet)
         ensure_pool_warm(quiet, start=not getattr(a, "dry_run", False))
         ensure_cache_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
         ensure_auth_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
@@ -4787,6 +4935,7 @@ def main() -> int:
     sc.set_defaults(fn=cmd_scale)
     at = sub.add_parser("attention", help="what needs you: rounds whose agent declined to act (PRs to close?), capped review exchanges")
     at.add_argument("--ack", metavar="PR|all", help="acknowledge (archive) the item(s) for this PR number, or all")
+    at.add_argument("--sweep", action="store_true", help="clear the items the facts have overtaken now (the watcher does this every 30 min)")
     at.add_argument("--lookup", action="store_true", help="resolve the PRs an item names (state, merge date, title) through the gate; cached in the item")
     at.add_argument("--retry", metavar="PR", help="after an infrastructure fix: reset this PR's review-error budget in every worker and archive its review-stuck item")
     at.add_argument("--file-roadmap", metavar="PR", type=int,
