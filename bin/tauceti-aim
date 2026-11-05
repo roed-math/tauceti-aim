@@ -191,6 +191,7 @@ def worker_env() -> dict[str, str]:
     env["TAUCETI_EXPECT_LOGIN"] = EXPECT_LOGIN
     if SHARED_CACHE:
         env["TAUCETI_SHARED_READ_CACHE"] = str(SHARED_CACHE)
+        env["TAUCETI_SHARED_ATTEMPTS_DIR"] = str(SHARED_CACHE / "attempts")
     # The wrapper's own gate calls (status, reconcile's backlog read, `attention --lookup`) share the
     # workers' budgets, so they must use the workers' NUMBERS: read them from the fleet config the
     # wrapper wrote (a hard-coded 600 here once made `gate status` print
@@ -645,6 +646,8 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
             # Scoreboard sidecars shared with the account's other fleets, so a slot starts warm.
             **({"TAUCETI_SHARED_READ_CACHE": str(SHARED_CACHE)} if SHARED_CACHE else {}),
+            # Attempt budgets too: one stuck PR spends its budget once, not once per fleet.
+            **({"TAUCETI_SHARED_ATTEMPTS_DIR": str(SHARED_CACHE / "attempts")} if SHARED_CACHE else {}),
             **({"TAUCETI_OWN_BRANCHES": OWN_BRANCHES} if OWN_BRANCHES else {}),
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
@@ -2340,12 +2343,62 @@ def targets_problem() -> str:
 
 
 def shared_cache_problem() -> str:
-    """Why this fleet could not share `fleet.shared_cache`, or "". Each fleet replaces and deletes sidecars
-    another fleet wrote, so `<shared_cache>/review_state` must be writable by every fleet user through
-    their group (setgid, so new files keep it) and must not be sticky. Creates it when missing."""
+    """Why this fleet could not share `fleet.shared_cache`, or "". Each fleet replaces and deletes files
+    another fleet wrote, so `<shared_cache>/review_state` and `<shared_cache>/attempts` must be writable by
+    every fleet user through their group (setgid, so new files keep it) and must not be sticky. Creates
+    them when missing."""
     if SHARED_CACHE is None:
         return ""
-    d = SHARED_CACHE / "review_state"
+    for d in (SHARED_CACHE / "review_state", SHARED_CACHE / "attempts"):
+        if problem := _shared_dir_problem(d):
+            return problem
+    return ""
+
+
+def merge_attempts_into_shared(quiet: bool = True) -> int:
+    """Once per fleet, carry its own attempt counts into the fleets' shared store, keeping the larger of
+    the two, so a PR whose budget this fleet spent stays spent for all of them. Workers then charge and
+    refund the shared store only, so a second merge could undo another fleet's refund: hence the marker."""
+    import fcntl
+
+    if SHARED_CACHE is None:
+        return 0
+    own, shared = GATE_DIR / "attempts", SHARED_CACHE / "attempts"
+    marker = own / ".merged-into-shared"
+    if marker.exists() or not own.is_dir() or _shared_dir_problem(shared):
+        return 0
+    n = 0
+    with open(shared / ".lock", "a") as lock:
+        with contextlib.suppress(OSError):
+            os.fchmod(lock.fileno(), 0o664)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for f in sorted(own.iterdir()):
+            if f.name.startswith("."):
+                continue
+            dst = shared / f.name
+            try:
+                ours = f.read_text().strip()
+                if f.suffix == ".json":  # a rebase checkpoint: the first fleet's stands
+                    if dst.exists():
+                        continue
+                else:
+                    theirs = dst.read_text().strip() if dst.exists() else ""
+                    if not ours.isdigit() or (theirs.isdigit() and int(theirs) >= int(ours)):
+                        continue
+                tmp = shared / f".{f.name}.{os.getpid()}.tmp"
+                tmp.write_text(ours)
+                os.chmod(tmp, 0o664)
+                os.replace(tmp, dst)
+                n += 1
+            except OSError:
+                continue
+    marker.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + f" {n} carried into {shared}\n")
+    if not quiet:
+        print(f"attempts: carried {n} count(s) into the fleets' shared store {shared}")
+    return n
+
+
+def _shared_dir_problem(d: Path) -> str:
     try:
         for p in (SHARED_CACHE, d):
             if not p.is_dir():
@@ -3489,6 +3542,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
                         freshen_logins(quiet=True)
                         login_incidents()
                         sweep_attention()
+                        merge_attempts_into_shared()
                         ensure_periodic(quiet=True)
                         ensure_auth_proxy_alive(quiet=True)
                     except Exception as exc:
@@ -3515,6 +3569,7 @@ def cmd_up(a: argparse.Namespace) -> int:
             die(problem)
     if problem := shared_cache_problem():
         die(problem)
+    merge_attempts_into_shared(quiet=False)
     if API:
         if problem := api_key_problem():
             die(problem)
@@ -3784,6 +3839,8 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
                      f"fixers {want_fix}")
         a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", MAX_REVIEWERS))
         dry = bool(getattr(a, "dry_run", False))
+        if not dry:
+            merge_attempts_into_shared(quiet)
         specs = lease_logins(fleet_specs(a), persist=not dry)
         statuses, hook_wid = worker_status(), os.environ.get("TAUCETI_ROUND_WID")
         changed, switched, deferred = write_config(specs, statuses, hook_wid, write=not dry)
