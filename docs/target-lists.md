@@ -47,7 +47,7 @@ A list goes stale in two ways: a PR marked in flight is closed rather than merge
 lands the milestone. Either leaves the items that need it ineligible, and the authors idle.
 
 The curator, the periodic `curate` round, fixes both, as described in
-[operating.md](operating.md#the-periodic-rounds). `tauceti-fleet targets` shows the same audit of
+[operating.md](operating.md#the-periodic-rounds). `tauceti-aim targets` shows the same audit of
 in-flight items by hand, and `--apply` writes the unambiguous changes.
 
 Mark an item `[~]` with `in flight: #N` when you open a PR for it by hand. The fleet's own authors
@@ -66,7 +66,7 @@ A list can be shared in two ways, and the two combine.
   a clone their users share; [setup.md](setup.md#sharing-one-target-list) sets one up.
 
 Everything that writes the list (the curate and decide rounds of every fleet, and
-`tauceti-fleet targets --apply`) takes the lock `.<name>.lock` beside it, then writes its edit merged
+`tauceti-aim targets --apply`) takes the lock `.<name>.lock` beside it, then writes its edit merged
 three ways with the list as it is at that moment. Edits to different items both land. Edits to the
 same or adjacent lines are not written, and the next round starts from the new list. The list's
 repository should ignore `.*.lock`, as this one does.
@@ -75,7 +75,7 @@ Two cases are left to you:
 
 - A clone with uncommitted changes, such as a hand edit, is never rebased. Commit the edit; the
   next curation pushes it.
-- A local commit that conflicts with the upstream is left in place, and `tauceti-fleet attention`
+- A local commit that conflicts with the upstream is left in place, and `tauceti-aim attention`
   lists it as `targets-diverged`. In the clone, `git pull --rebase`, settle the list by hand, and
   `git push`.
 

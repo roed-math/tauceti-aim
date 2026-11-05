@@ -1,22 +1,27 @@
-# tauceti-fleet
+# tauceti-aim
 
 Run a fleet of [TauCetiWorker](https://github.com/kim-em/TauCetiWorker) workers against
 [Tau Ceti](https://github.com/TauCetiProject/TauCeti), aimed at one goal: an **operator target list**
 of roadmap milestones you want proved. The fleet authors PRs for those milestones, fixes and rebases
 its own PRs, reviews other people's PRs in return, and keeps the target list true as work lands.
 
-One command, `tauceti-fleet`, shapes the fleet from the backlog, drives the worker's own manager,
+One command, `tauceti-aim`, shapes the fleet from the backlog, drives the worker's own manager,
 keeps a pool of Claude logins that renew themselves, runs everything through a shared GitHub
 budget, and shows a live view.
 
 ```
-bin/tauceti-fleet        the tool
+bin/tauceti-aim          the tool
 targets/                 target lists; each fleet points at one of them
 docs/setup.md            installing a host, each user on it, and several fleets on one host
 docs/operating.md        what the fleet does on its own, and what needs you
 docs/target-lists.md     writing a target list, and sharing one
 docs/troubleshooting.md  symptoms, what causes them, and the fix
 ```
+
+This was `tauceti-fleet` until 2026-11-04; the new name keeps clear of
+[TauCetiFleet](https://github.com/TauCetiProject/TauCetiFleet)'s command. `bin/tauceti-fleet` stays as
+a link so installed hooks, timers and `~/.local/bin` links keep working, and the fleet home
+(`~/.tauceti-fleet`), the `TAUCETI_FLEET_*` variables and the timer's unit name are unchanged.
 
 Everything about one particular fleet lives in its **settings file**, outside this repository. The
 only fleet-specific files here are the target lists.
@@ -47,7 +52,7 @@ only fleet-specific files here are the target lists.
   next eligible milestone on the target list and open a PR for it. **Fixers** answer review, repair
   CI and rebase the fleet's own PRs. **Reviewers** review other people's PRs, which is what the fleet
   owes the project for the reviews its PRs get.
-- After every round the worker calls `tauceti-fleet reconcile`, which **reshapes the fleet** from the
+- After every round the worker calls `tauceti-aim reconcile`, which **reshapes the fleet** from the
   backlog: more fixers when many PRs need work, no authors while too many PRs are open. With
   `up.flex = true` there are no fixed roles: each author and fixer chooses at the start of every
   round, fixing while any of the fleet's PRs needs work and authoring otherwise.
@@ -59,17 +64,17 @@ only fleet-specific files here are the target lists.
 - Claude renews its access tokens by revoking the old ones, so the fleet keeps a **pool of logins**,
   one per concurrently running worker, and renews them itself.
 - Periodic rounds keep the **target list true** (the curator) and rule on rounds whose agent declined
-  to act (the decide stage). What needs you is collected in one place: `tauceti-fleet attention`.
+  to act (the decide stage). What needs you is collected in one place: `tauceti-aim attention`.
 
 ## Quick start
 
 On a host prepared as in [docs/setup.md](docs/setup.md):
 
 ```bash
-tauceti-fleet init --name gq2 --targets ~/tauceti-fleet/targets/gq2_axiom_targets.md --github-login YOUR-BOT
-tauceti-fleet logins     # prints one `claude auth login` line per login chain still missing
-tauceti-fleet round      # one supervised round first; read its log and any PR it opened
-tauceti-fleet up         # then the fleet; the live view opens
+tauceti-aim init --name gq2 --targets ~/tauceti-aim/targets/gq2_axiom_targets.md --github-login YOUR-BOT
+tauceti-aim logins     # prints one `claude auth login` line per login chain still missing
+tauceti-aim round      # one supervised round first; read its log and any PR it opened
+tauceti-aim up         # then the fleet; the live view opens
 ```
 
 `up` starts in **pilot mode** unless you change it: one Claude author and no `auto` author, rounds
@@ -100,7 +105,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `up.sandbox` | `bubble` (egress-denied containers) or `host` | `init` writes `bubble` |
 | `up.pace` | the worker's pacing curve, `time%:budget%` points; the reconcile applies a change | the worker's own curve |
 | `up.pace_claude`, `up.pace_codex` | a curve for that provider's windows only, overriding `up.pace` (an `auto` worker paces each provider on its own); the reconcile applies a change | `up.pace` |
-| `schedule.active` | weekly active slots in host-local time, e.g. `"Thu 07:00 -> Sat 15:00"` (comma-separated for several); `tauceti-fleet schedule --install` adds a systemd user timer that runs `up` when a slot opens and `down --drain` when it closes, acting only at the boundaries. `"always"`: the timer starts the fleet, and starts it again whenever its manager has gone (a reboot) unless `down` stopped it | unset: no timer action |
+| `schedule.active` | weekly active slots in host-local time, e.g. `"Thu 07:00 -> Sat 15:00"` (comma-separated for several); `tauceti-aim schedule --install` adds a systemd user timer that runs `up` when a slot opens and `down --drain` when it closes, acting only at the boundaries. `"always"`: the timer starts the fleet, and starts it again whenever its manager has gone (a reboot) unless `down` stopped it | unset: no timer action |
 | `claude.billing` | `subscription` (the login pool, paced by usage windows) or `api`: every worker runs Claude only, on the key in `claude.api_key_file`, with no pacing and no login pool | `subscription` |
 | `claude.token_file` | a `claude setup-token` token every worker runs on, instead of the login pool; usage is read through one login, `logins/usage` ([setup](docs/setup.md#two-sign-ins-instead-of-a-pool)) | none |
 | `claude.api_key_file`, `claude.budget` | with `api`: the private file (mode 600) holding the key, and whether each session is admitted against the local grant ledger (`budget` below) | `~/.config/tauceti/anthropic.key`, `true` |

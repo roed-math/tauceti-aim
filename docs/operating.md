@@ -5,7 +5,7 @@ home (`$TAUCETI_FLEET_HOME`, default `~/.tauceti-fleet`).
 
 ## The shape follows the backlog
 
-After every round, the worker runs `tauceti-fleet reconcile` through its round-done hook. The
+After every round, the worker runs `tauceti-aim reconcile` through its round-done hook. The
 reconcile reads the counts that round's survey left behind, so it costs no GitHub request, and
 reshapes the fleet:
 
@@ -46,7 +46,7 @@ reads just the PR list.
 **Config changes wait for the round to end.** The manager restarts a worker whenever its entry in
 `workers.toml` changes, which mid-round would throw away a build. The reconcile keeps a mid-round
 worker's old entry and switches it at a later reconcile that finds it between rounds; the reconcile
-line lists these as `deferred (mid-round)`. `tauceti-fleet reconcile --dry-run` shows what a pass
+line lists these as `deferred (mid-round)`. `tauceti-aim reconcile --dry-run` shows what a pass
 would do.
 
 ## The GitHub gate
@@ -54,19 +54,19 @@ would do.
 Every request the workers and the tool make as the fleet's account goes through one gate store
 (`gate/`) with rolling-hour budgets: `gate.mutations_per_hour` for writes and `gate.reads_per_hour`
 for reads. A worker that sees any identity other than `fleet.github_login`, or a credential error,
-halts and stays halted until you look: `tauceti-fleet clear-halt` shows the incident and clears it.
+halts and stays halted until you look: `tauceti-aim clear-halt` shows the incident and clears it.
 
 ```bash
-tauceti-fleet gate status
+tauceti-aim gate status
 ```
 
 ```bash
-tauceti-fleet gate report --since 24h
+tauceti-aim gate report --since 24h
 ```
 
 The status line lists budgets used, pushes per repository, and publications (PR creations, pushes,
 comments) still in progress or parked. A round that failed before publishing leaves a parked entry
-with no remote effect; `tauceti-fleet gate publication prune` archives those.
+with no remote effect; `tauceti-aim gate publication prune` archives those.
 
 Budgets are staging controls, not guarantees. Raise them only after measuring a quiet week.
 
@@ -88,7 +88,7 @@ it, the attention list has a `login` item with the sign-in command, and the reco
 worker to a healthy free chain if there is one.
 
 ```bash
-tauceti-fleet logins
+tauceti-aim logins
 ```
 
 prints the chains, the leases, and the exact sign-in line for each chain still missing. Workers left
@@ -96,7 +96,7 @@ without a chain share `~/.claude`, and `logins` says so.
 
 ## Things that need you
 
-The live view shows a `needs you` badge and panel; `tauceti-fleet attention` prints them in full.
+The live view shows a `needs you` badge and panel; `tauceti-aim attention` prints them in full.
 
 - **A round declined to act, and the decide stage handed it to you.** A fix or rebase round whose
   agent could not act files an incident with the agent's last words and the PRs it named. The decide
@@ -127,7 +127,7 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
   item stays after the slot ends, so a lost slot is seen, and clears at the next successful `up`
   or with `--ack schedule`.
 
-A worker in a long backoff can be restarted between rounds with `tauceti-fleet restart ID`, or
+A worker in a long backoff can be restarted between rounds with `tauceti-aim restart ID`, or
 `--when-idle` to queue it for the end of the current round.
 
 ## Lookahead authoring
@@ -159,7 +159,7 @@ and leaves an eligible item with a fresh branch for six hours (`TAUCETI_LOOKAHEA
 before authoring it fresh. Without the setting a fleet does none of this and never lists the
 branches. Items marked `lookahead: no` in the target list are skipped.
 
-`tauceti-fleet lookahead SLUG` runs one such round on that item now, setting or no setting: a session
+`tauceti-aim lookahead SLUG` runs one such round on that item now, setting or no setting: a session
 while the item is blocked, its port once it is eligible. It runs as the periodic worker under the
 periodic lock, as `review` does, so curate and decide wait for it.
 
@@ -195,8 +195,8 @@ outside the list would alone use up the budget before the slot ends, the attenti
 ## Watching all fleets
 
 Each fleet can publish its live view as `<fleet.status_dir>/<name>.json`, after every round and on
-every schedule tick (each minute), with `tauceti-fleet publish` to force one. A user with no fleet of
-its own, such as the shared `agents` account, then runs `tauceti-fleet watch` and sees all of them:
+every schedule tick (each minute), with `tauceti-aim publish` to force one. A user with no fleet of
+its own, such as the shared `agents` account, then runs `tauceti-aim watch` and sees all of them:
 
 - a strip with one line per fleet: running, draining, or off, and when its slot starts or ends, in
   red when a slot's start failed;
@@ -207,7 +207,7 @@ its own, such as the shared `agents` account, then runs `tauceti-fleet watch` an
 The fleets publish rather than open their homes to the viewer: a fleet home holds its Claude login
 chains, and the workers' private homes hold access-token copies the sandbox reads. The view needs
 only Python with `rich` (the system `python3-rich` will do) and the script, for example
-`/home/agents/fleet-shared/tauceti-fleet/bin/tauceti-fleet watch`. A snapshot older than 15 minutes
+`/home/agents/fleet-shared/tauceti-fleet/bin/tauceti-aim watch`. A snapshot older than 15 minutes
 shows its age in red. `--fleets DIR` reads another directory.
 
 ## The progress-report worker
@@ -291,11 +291,11 @@ due. One runs at a time.
   Besides a close, the stage writes only the fleet's own records and the target list.
 
 ```bash
-tauceti-fleet periodic
+tauceti-aim periodic
 ```
 
 ```bash
-tauceti-fleet periodic --now curate
+tauceti-aim periodic --now curate
 ```
 
 ## The Mathlib cache pool
@@ -315,22 +315,22 @@ the fix installed that should never fire.
 
 ## Stopping without losing work
 
-`tauceti-fleet down` stops the manager and every worker at once, which throws away any round in
+`tauceti-aim down` stops the manager and every worker at once, which throws away any round in
 flight. To stop for maintenance instead:
 
 ```bash
-tauceti-fleet down --drain
+tauceti-aim down --drain
 ```
 
 Every worker between rounds stops at once; a worker mid-round finishes its round and stops when it
 ends; once none is left, the manager stops. No periodic round starts meanwhile, and no login chain
 changes hands. A round can last as long as the round timeout, so a drain can take that long; the
-live view shows `DRAINING` until it is done. `tauceti-fleet up` ends a drain and starts the fleet
+live view shows `DRAINING` until it is done. `tauceti-aim up` ends a drain and starts the fleet
 again.
 
 ## Logs
 
 Every worker writes durable logs under `state/logs/<id>/`; the periodic rounds under
-`state/logs/<name>-periodic/`. `tauceti-fleet logs ID -f` follows one. The live view shows health,
+`state/logs/<name>-periodic/`. `tauceti-aim logs ID -f` follows one. The live view shows health,
 the phase and target of each round, the last log line, subscription usage left, the gate, and the
 pool; its `recent events` panel fills the rest of the screen.

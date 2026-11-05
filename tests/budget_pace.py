@@ -40,7 +40,7 @@ fallback_auto_max = 40
 active = "Mon 23:00 -> Thu 07:00"
 """)
 os.environ["TAUCETI_FLEET_HOME"] = str(HOME)
-loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-fleet"))
+loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-aim"))
 spec = importlib.util.spec_from_loader("tf", loader)
 tf = importlib.util.module_from_spec(spec)
 loader.exec_module(tf)

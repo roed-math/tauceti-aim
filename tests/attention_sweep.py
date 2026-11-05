@@ -21,7 +21,7 @@ HERE = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp(prefix="attention-sweep-"))
 (TMP / "fleet").mkdir()
 os.environ["TAUCETI_FLEET_HOME"] = str(TMP / "fleet")
-loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-fleet"))
+loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-aim"))
 spec = importlib.util.spec_from_loader("tf", loader)
 tf = importlib.util.module_from_spec(spec)
 loader.exec_module(tf)

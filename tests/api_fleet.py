@@ -34,7 +34,7 @@ def load(name: str, toml: str):
     home.mkdir()
     (home / "fleet.toml").write_text(toml)
     os.environ["TAUCETI_FLEET_HOME"] = str(home)
-    loader = importlib.machinery.SourceFileLoader(name, str(HERE / "bin" / "tauceti-fleet"))
+    loader = importlib.machinery.SourceFileLoader(name, str(HERE / "bin" / "tauceti-aim"))
     mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
     loader.exec_module(mod)
     return mod, home

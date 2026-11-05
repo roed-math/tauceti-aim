@@ -21,7 +21,7 @@ TMP = Path(tempfile.mkdtemp(prefix="operator-creds-"))
 os.environ["TAUCETI_FLEET_HOME"] = str(TMP / "fleet")
 for var in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "TAUCETI_DATA_HOME"):
     os.environ.pop(var, None)
-loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-fleet"))
+loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-aim"))
 spec = importlib.util.spec_from_loader("tf", loader)
 tf = importlib.util.module_from_spec(spec)
 loader.exec_module(tf)

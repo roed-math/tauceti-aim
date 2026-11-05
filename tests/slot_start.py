@@ -38,7 +38,7 @@ day = lambda t: t.strftime("%a %H:%M")  # noqa: E731
 os.environ["TAUCETI_FLEET_HOME"] = str(HOME)
 for var in ("INVOCATION_ID", "TAUCETI_FLEET_SHARED_CACHE"):
     os.environ.pop(var, None)
-loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-fleet"))
+loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-aim"))
 spec = importlib.util.spec_from_loader("tf", loader)
 tf = importlib.util.module_from_spec(spec)
 loader.exec_module(tf)
@@ -53,7 +53,7 @@ def check(name, cond, detail=""):
 
 
 def run(*argv):
-    sys.argv = ["tauceti-fleet", *argv]
+    sys.argv = ["tauceti-aim", *argv]
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
         try:

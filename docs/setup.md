@@ -171,7 +171,7 @@ git clone https://github.com/TauCetiProject/TauCetiRoadmap.git ~/TauCetiRoadmap
 ```
 
 ```bash
-git clone https://github.com/roed-math/tauceti-fleet.git ~/tauceti-fleet
+git clone https://github.com/roed-math/tauceti-aim.git ~/tauceti-aim
 ```
 
 ```bash
@@ -179,7 +179,7 @@ uv tool install git+https://github.com/kim-em/TauCetiWorker.git
 ```
 
 ```bash
-ln -sf ~/tauceti-fleet/bin/tauceti-fleet ~/.local/bin/tauceti-fleet
+ln -sf ~/tauceti-aim/bin/tauceti-aim ~/.local/bin/tauceti-aim
 ```
 
 The `uv tool install` of the upstream worker is only there to give the tool an interpreter with
@@ -213,7 +213,7 @@ codex login --device-auth
 `codex login` waits for a browser on the host itself. One login per fleet user is enough: Codex is
 not pooled, and the fleet renews it.
 
-Claude signs in once per login chain, after `init`: `tauceti-fleet logins` prints the lines.
+Claude signs in once per login chain, after `init`: `tauceti-aim logins` prints the lines.
 
 The curator commits the target list it edits and pushes it to the list's `origin`, so the fleet's
 account must be able to push there. If it cannot, the commits stay local and nothing else breaks.
@@ -221,11 +221,11 @@ account must be able to push there. If it cannot, the commits stay local and not
 ## 4. Create the fleet
 
 ```bash
-tauceti-fleet init --name NAME --targets ~/tauceti-fleet/targets/YOUR_LIST.md --github-login YOUR-BOT
+tauceti-aim init --name NAME --targets ~/tauceti-aim/targets/YOUR_LIST.md --github-login YOUR-BOT
 ```
 
 ```bash
-tauceti-fleet logins
+tauceti-aim logins
 ```
 
 Run each printed `CLAUDE_CONFIG_DIR=… claude auth login` line and sign in with the subscription the
@@ -253,7 +253,7 @@ token_file = "~/.config/tauceti/claude-setup-token"
 
 Every worker's agents then run on that token, which lasts a year and never rotates, so the workers
 can share it. Its scope cannot read the usage endpoint, so the pacer reads usage through one ordinary
-login, which `tauceti-fleet logins` names (`CLAUDE_CONFIG_DIR=…/logins/usage claude auth login`).
+login, which `tauceti-aim logins` names (`CLAUDE_CONFIG_DIR=…/logins/usage claude auth login`).
 That login needs a fresh sign-in about every 28 days. The attention list asks for it four days ahead,
 and asks for a new token a month before the old one's year runs out.
 
@@ -264,15 +264,15 @@ bash ~/TauCetiWorker-v2/tests/run-all
 ```
 
 ```bash
-tauceti-fleet up --dry-run
+tauceti-aim up --dry-run
 ```
 
 ```bash
-tauceti-fleet round
+tauceti-aim round
 ```
 
 `round` ends with the gate report: every request accounted for, no halts, nothing parked. Read the
-round's log and any pull request it opened as you would a colleague's. Then `tauceti-fleet up`.
+round's log and any pull request it opened as you would a colleague's. Then `tauceti-aim up`.
 
 ## Several fleets on one host
 
@@ -341,28 +341,28 @@ curator marks done is done for both at once.
 2. A clone of the list's repository there, group-writable, with git told to keep it so:
 
    ```bash
-   git clone https://github.com/YOU/tauceti-fleet.git /home/shared/fleet/tauceti-fleet
+   git clone https://github.com/YOU/tauceti-aim.git /home/shared/fleet/tauceti-aim
    ```
 
    ```bash
-   cd /home/shared/fleet/tauceti-fleet && git config core.sharedRepository group && chmod -R g+rwX . && find . -type d -exec chmod g+s {} +
+   cd /home/shared/fleet/tauceti-aim && git config core.sharedRepository group && chmod -R g+rwX . && find . -type d -exec chmod g+s {} +
    ```
 
 3. As each fleet user, tell git to trust the clone. git refuses a repository another user owns,
    and the curator could then neither commit nor sync the list:
 
    ```bash
-   git config --global --add safe.directory /home/shared/fleet/tauceti-fleet
+   git config --global --add safe.directory /home/shared/fleet/tauceti-aim
    ```
 
 4. Point every fleet's `fleet.targets` at the list in that clone. `up` refuses to start a fleet that
    could not keep the list: refused by git, not group-shared, or not writable.
 
 Whoever writes the list (the curate and decide rounds of any of the fleets, or
-`tauceti-fleet targets --apply`) takes a lock beside it and merges its edit with whatever changed
+`tauceti-aim targets --apply`) takes a lock beside it and merges its edit with whatever changed
 since it read the list; [target-lists.md](target-lists.md#sharing-a-list) has the details.
 
-Watch the first rounds of the second fleet: `tauceti-fleet gate status` in each, and `incus list`
+Watch the first rounds of the second fleet: `tauceti-aim gate status` in each, and `incus list`
 to see both fleets' containers by name.
 
 ### Sharing the read cache
@@ -425,19 +425,19 @@ costs.
 The ledger starts empty, so nothing runs until you grant some:
 
 ```bash
-tauceti-fleet budget --grant 100
+tauceti-aim budget --grant 100
 ```
 
 ```bash
-tauceti-fleet budget --grant-rate 20
+tauceti-aim budget --grant-rate 20
 ```
 
 The first adds $100 once; the second adds $20 an hour from now on, also while the fleet is
-stopped. `tauceti-fleet budget` shows the balance, and the view's `usage` row shows it too. The
+stopped. `tauceti-aim budget` shows the balance, and the view's `usage` row shows it too. The
 ledger is local accounting from the costs Claude reports, not the Console's bill.
 
 A fleet that should run all the time sets `schedule.active = "always"` and installs the timer
-(`tauceti-fleet schedule --install`): it starts the fleet, and starts it again after a reboot,
+(`tauceti-aim schedule --install`): it starts the fleet, and starts it again after a reboot,
 unless `down` stopped it.
 
 ## macOS

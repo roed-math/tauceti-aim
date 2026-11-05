@@ -5,12 +5,12 @@ thing in their first log line, so the cause is worth reading even when the sympt
 
 ## Where to look
 
-- `tauceti-fleet status` (or `watch`): each worker's health and phase, the subscription usage left,
+- `tauceti-aim status` (or `watch`): each worker's health and phase, the subscription usage left,
   the gate, the Mathlib pool and what needs you.
-- `tauceti-fleet logs ID -f`: one worker's log. Each round's agent transcript is beside it under
+- `tauceti-aim logs ID -f`: one worker's log. Each round's agent transcript is beside it under
   `state/logs/<id>/` in the fleet home.
-- `tauceti-fleet attention`: everything the fleet is waiting on you for.
-- `tauceti-fleet gate report --since 24h`: every GitHub request, admitted or refused.
+- `tauceti-aim attention`: everything the fleet is waiting on you for.
+- `tauceti-aim gate report --since 24h`: every GitHub request, admitted or refused.
 - `watchdog.log` in the fleet home: the daemons the reconcile restarted, and why.
 - bubble's own logs, `~/.bubble/auth-proxy.log` and `~/.bubble/artifact-cache.log`, and `incus list`.
 
@@ -22,7 +22,7 @@ resume by themselves. Another Claude subscription, or Codex for the `auto` worke
 
 **Authors idle with "no open targets … eligible".** Either the list's in-flight items are stale (a
 PR closed rather than merged, so everything that needs it waits), or every open item waits on a
-prerequisite. `tauceti-fleet targets` audits the in-flight items, and the curator fixes the
+prerequisite. `tauceti-aim targets` audits the in-flight items, and the curator fixes the
 unambiguous ones every 6 hours. When the list has nothing to offer, authors work outside it while the
 account has at most `authoring.fallback_max_open` open PRs.
 
@@ -43,7 +43,7 @@ did not have yet. `up` now fast-forwards that checkout when it is a clean `main`
 cannot.
 
 **A worker halted.** It saw an identity other than `fleet.github_login`, or a credential error.
-`tauceti-fleet clear-halt` shows the incident and clears it once you have looked.
+`tauceti-aim clear-halt` shows the incident and clears it once you have looked.
 
 ## Rounds fail or hang
 
@@ -54,7 +54,7 @@ reconcile has moved the worker to a free chain if one was healthy.
 
 **A Claude round fails with "401 OAuth access token has been revoked", just after another worker
 logged "access token renewed".** The two workers share a login chain, and renewing a Claude token
-revokes the old one. `tauceti-fleet logins` lists the chains still to sign in; every Claude-capable
+revokes the old one. `tauceti-aim logins` lists the chains still to sign in; every Claude-capable
 worker should hold its own.
 
 **Rounds hang in `lake cache get`; workers say "running" but use no CPU.** bubble's artifact cache
@@ -113,7 +113,7 @@ commit stays local" means the fleet's account cannot push to the list's reposito
 elsewhere. See [target-lists.md](target-lists.md#sharing-a-list).
 
 **`gate status` lists parked publications.** Rounds that failed before they published anything
-leave a parked record with no effect on GitHub. `tauceti-fleet gate publication prune` archives them.
+leave a parked record with no effect on GitHub. `tauceti-aim gate publication prune` archives them.
 
 ## Setting up
 

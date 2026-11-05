@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The fleet's size settings come from fleet.toml, and `tauceti-fleet logins` counts by them, offline:
+"""The fleet's size settings come from fleet.toml, and `tauceti-aim logins` counts by them, offline:
   * up.max_fixers / up.max_reviewers bound the reconcile's fixer and reviewer counts;
   * fixers grow with the backlog in the progression up.fixer_backlog_start / up.fixer_backlog_step, and
     the defaults (6, 2) give the counts the fixed thresholds gave before;
@@ -29,7 +29,7 @@ HOME = TMP / "fleet"
     f'\n[[workers]]\nid = "tst-{w}"\nenabled = true\nagent = "{agent}"\n'
     for w, agent in (("c1", "claude"), ("c2", "claude"), ("x1", "auto"), ("x2", "auto"), ("fix1", "claude"), ("rev1", "auto"))))
 os.environ["TAUCETI_FLEET_HOME"] = str(HOME)
-loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-fleet"))
+loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-aim"))
 spec = importlib.util.spec_from_loader("tf", loader)
 tf = importlib.util.module_from_spec(spec)
 loader.exec_module(tf)
@@ -54,7 +54,7 @@ check("the defaults give the fixed thresholds' counts (1 below 6, 2 at 6-7, 3 fr
 check("…and up to up.max_reviewers reviewers once the fleet is busy",
       tf.reviewers_for(2, tf.MAX_REVIEWERS) == 3 and tf.reviewers_for(1, tf.MAX_REVIEWERS) == 1)
 
-sys.argv = ["tauceti-fleet", "logins"]
+sys.argv = ["tauceti-aim", "logins"]
 out = io.StringIO()
 with contextlib.redirect_stdout(out):
     tf.main()

@@ -23,7 +23,7 @@ LIST = TMP / "targets.md"
 )
 os.environ["TAUCETI_FLEET_HOME"] = str(HOME)
 os.environ.pop("TAUCETI_FLEET_TARGETS", None)
-loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-fleet"))
+loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-aim"))
 spec = importlib.util.spec_from_loader("tf", loader)
 tf = importlib.util.module_from_spec(spec)
 loader.exec_module(tf)

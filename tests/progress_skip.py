@@ -28,7 +28,7 @@ def load(name: str, progress: str):
     (home / "fleet.toml").write_text(f'[fleet]\nname = "tst"\ngithub_login = "acct"\ntargets = "none"\n'
                                      f'[progress]\nenabled = true\nstrategy = "threshold"\n{progress}')
     os.environ["TAUCETI_FLEET_HOME"] = str(home)
-    loader = importlib.machinery.SourceFileLoader(name, str(HERE / "bin" / "tauceti-fleet"))
+    loader = importlib.machinery.SourceFileLoader(name, str(HERE / "bin" / "tauceti-aim"))
     mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
     loader.exec_module(mod)
     return mod
