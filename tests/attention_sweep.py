@@ -123,6 +123,12 @@ active["now"] = True
 tf.sweep_attention()
 check("...but stays in the slot", (tf.INCIDENTS / "budget-short-claude.json").exists())
 
+shown = lambda **d: tf.lookahead_needs_owner({"kind": "lookahead", **d})
+check("a lookahead session's first failure is not shown, its second is",
+      not shown(what="failed", count=1) and shown(what="failed", count=2))
+check("...a port round that stood down never is, an unreadable header always is",
+      not shown(what="mismatch", count=3) and shown(what="unreadable", count=1))
+
 try:
     from rich.console import Console
 except ImportError:

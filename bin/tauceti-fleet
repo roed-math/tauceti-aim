@@ -1550,6 +1550,8 @@ def attention_items() -> list[dict]:
         if d.get("kind") and d.get("kind") != "targets-updated":
             if awaiting_decide(d):
                 continue  # the decide stage rules on it shortly; see pending_decide()
+            if not lookahead_needs_owner(d):
+                continue
             d["_path"] = p
             items.append(d)
     items.sort(key=lambda d: str(d.get("last_at") or ""))
@@ -1559,6 +1561,15 @@ def attention_items() -> list[dict]:
                       "last_at": undecided[0][0], "summary": "\n".join(n for _t, n in undecided),
                       "slugs": [n.split("`")[1] for _t, n in undecided if n.count("`") >= 2]})
     return items
+
+
+def lookahead_needs_owner(d: dict) -> bool:
+    """A port round that stood down (`mismatch`) needs nobody, and neither does a session's first
+    `failed` (a build cut off by the round's end, a branch with nothing new to do): the record still
+    holds the item back for FAILED_HOLD_DAYS, and a second failure in a row is shown."""
+    if d.get("kind") != "lookahead":
+        return True
+    return d.get("what") != "mismatch" and not (d.get("what") == "failed" and int(d.get("count") or 1) < 2)
 
 
 # A decline the decide stage has not ruled on within this long is shown to the owner anyway: a stage
