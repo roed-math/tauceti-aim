@@ -361,6 +361,7 @@ LEASES = LOGINS / "leases.json"
 # the pacer reads usage with. Neither is a pool chain.
 TOKEN_DIR = LOGINS / "token"
 USAGE_LOGIN = LOGINS / "usage"
+USAGE_CACHE = USAGE_LOGIN / ".tauceti-quota" / "usage-cache"  # the worker's Quota._cache for Claude through this login
 SETUP_TOKEN_LIFETIME_S = 365 * 86400
 TOKEN_WARN_S = 30 * 86400
 # A Claude login stops renewing 27-30 days after its sign-in (refreshTokenExpiresAt; measured 2026-11-02).
@@ -1272,10 +1273,11 @@ def credential_lines() -> list[tuple[str, str]]:
 # ----------------------------------------------------------------------------- subscription usage
 #
 # The workers' pacer reads each provider's usage endpoint with the worker's own token and caches the
-# raw response under state/<wid>/cache/quota-<provider>.json. The view shows the freshest of those:
-# no token ever enters this process and no request is made on the view's behalf. Every worker on this
-# host runs the same two subscriptions (several Claude login chains are one account), so one reading
-# per provider describes the whole fleet.
+# raw response under state/<wid>/cache/quota-<provider>.json, or, for Claude in token mode, in the one
+# cache all workers share (USAGE_CACHE). The view shows the freshest of those: no token ever enters
+# this process and no request is made on the view's behalf. Every worker on this host runs the same two
+# subscriptions (several Claude login chains are one account), so one reading per provider describes
+# the whole fleet.
 
 
 def _parse_iso(v) -> float | None:
@@ -1286,16 +1288,16 @@ def _parse_iso(v) -> float | None:
 
 
 def newest_quota_cache(provider: str) -> tuple[dict, float, str] | None:
-    """(payload, fetched_at, worker id) of the freshest usage response any worker cached."""
+    """(payload, fetched_at, source) of the freshest usage response cached; the source is a worker id
+    or "usage login"."""
     best = None
     root = WORKTREE / "state"
-    if not root.is_dir():
-        return None
-    for f in root.glob(f"*/cache/quota-{provider}.json"):
+    files = [(f, f.parent.parent.name) for f in root.glob(f"*/cache/quota-{provider}.json")] if root.is_dir() else []
+    for f, source in [*files, (USAGE_CACHE / f"quota-{provider}.json", "usage login")]:
         d = read_json(f)
         at = d.get("fetched_at")
         if isinstance(at, (int, float)) and isinstance(d.get("payload"), dict) and (best is None or at > best[1]):
-            best = (d["payload"], float(at), f.parent.parent.name)
+            best = (d["payload"], float(at), source)
     return best
 
 
@@ -1343,10 +1345,12 @@ def _reset_phrase(t: float | None) -> str:
         return f"resets in {int(left // 60)}m"
     when = datetime.fromtimestamp(t)
     # A bare time only for a reset later today: "resets 14:59" at 04:00 on Friday read as this
-    # afternoon when it meant Saturday's (the old rule was "under 36 hours away").
-    if when.date() == datetime.now().date():
+    # afternoon when it meant Saturday's (the old rule was "under 36 hours away"). A bare weekday only
+    # within the coming week: a 30-day window's "resets Thu 15:21", read on a Thursday, meant in two weeks.
+    days = (when.date() - datetime.now().date()).days
+    if days == 0:
         return f"resets {when:%H:%M}"
-    return f"resets {when:%a %H:%M}"
+    return f"resets {when:%a %H:%M}" if days < 7 else f"resets {when:%a %m-%d %H:%M}"
 
 
 def usage_text():
@@ -1364,7 +1368,8 @@ def usage_text():
         if got is None:
             t.append("no reading yet", "dim")
             continue
-        payload, at, wid = got
+        payload, at, source = got
+        stale = time.time() - at > PACE_STALE
         wins = usage_windows(provider, payload)
         if not wins:
             t.append("unreadable response", "yellow")
@@ -1372,13 +1377,13 @@ def usage_text():
             if j:
                 t.append(" · ")
             left = max(0.0, 100.0 - float(used)) if isinstance(used, (int, float)) and not isinstance(used, bool) else None
-            style = "dim" if left is None else "red" if left < 15 else "yellow" if left < 40 else "green"
+            style = "dim" if left is None or stale else "red" if left < 15 else "yellow" if left < 40 else "green"
             t.append(f"{label} ")
             t.append("?" if left is None else f"{left:.0f}% left", style)
             r = _reset_phrase(reset)
             if r:
                 t.append(f" ({r})", "dim")
-        t.append(f"  [{wid}, {age(at)} ago]", "dim")
+        t.append(f"  [{source}, {age(at)} ago{', stale' if stale else ''}]", "dim")
     return t
 
 
@@ -1698,7 +1703,7 @@ def _overtaken(d: dict, view: dict | None, branches: dict | None, listed_at: flo
             return "branch reads", f"{d.get('branch')} reads as {row.get('status')} at {str(row.get('sha'))[:12]}"
         if last and (row.get("built_at") or 0) > last:
             return "branch pushed", f"{d.get('branch')} was pushed since, at {str(row.get('sha'))[:12]}"
-    if kind in ("budget-short", "budget-reset") and active is False:
+    if kind in ("budget-short", "budget-reset", "budget-blind") and active is False:
         return "slot ended", "the fleet's slot ended"
     return "", ""
 
@@ -3107,6 +3112,8 @@ PACE_EVERY = 900  # seconds between steps
 PACE_WINDOW = 3 * 3600  # the burn rate and the spend shares are measured over this much recent time
 PACE_MIN_SPAN = 3600  # less history than this is a warm-up: the cap holds
 PACE_STALE = 1800  # a reading older than this moves nothing
+PACE_BLIND = 2 * 3600  # a running fleet this long without a current reading is a fault: workers parked at a limit still read hourly
+BLIND_SINCE = FLEET_HOME / "budget-blind-since.json"
 BUDGET_FLOOR = 0.05  # kept on top of the target reserve: target demand jumps when items become eligible
 EXTRA_CLAIMED = FLEET_HOME / "budget-extra-claimed.json"  # written when the readings show the reset claimed
 RESET_DUE_AT = 0.10  # weekly budget left below which an unclaimed reset is put on the attention list
@@ -3300,6 +3307,7 @@ def budget_pace(force: bool = False) -> dict | None:
             return state
         r = claude_week_reading()
         n_open = our_open_prs()
+        budget_blind_incident(now, r[0] if r else None)
         if r is None or now - r[0] > PACE_STALE or n_open is None:
             return state  # nothing current to judge by: the cap holds (the workers drop a stale file)
         at, used, resets = r
@@ -3343,6 +3351,30 @@ def budget_pace(force: bool = False) -> dict | None:
     except Exception as exc:  # pacing is advisory: never fail a round, a tick or a reconcile
         _watchdog_note(f"budget: {exc}")
         return None
+
+
+def budget_blind_incident(now: float, reading_at: float | None) -> None:
+    """A `budget-blind` item in the attention list once a running fleet has gone PACE_BLIND without a
+    current Claude reading: the cap cannot move, the workers fall back to fallback_auto_min, and no
+    `budget-short` can fire. Called only while the fleet runs, so a gap in `seen` restarts the clock."""
+    path = INCIDENTS / "budget-blind-claude.json"
+    if reading_at is not None and now - reading_at <= PACE_STALE:
+        BLIND_SINCE.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        return
+    mark = read_json(BLIND_SINCE) if BLIND_SINCE.is_file() else {}
+    since = float(mark["since"]) if now - float(mark.get("seen") or 0) < PACE_BLIND else now
+    BLIND_SINCE.write_text(json.dumps({"since": since, "seen": now}) + "\n")
+    if now - since < PACE_BLIND:
+        return
+    prev = read_json(path) if path.is_file() else {}
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    last = f"the last is {age(reading_at)} old" if reading_at is not None else "there is none"
+    rec = {"kind": "budget-blind", "key": "claude", "worker": PERIODIC_WID, "first_at": prev.get("first_at") or stamp,
+           "last_at": stamp, "detail": f"no current Claude usage reading while the fleet runs ({last}): the outside-list "
+           f"cap is at fallback_auto_min and budget warnings cannot fire; compare {USAGE_CACHE} with the workers' quota lines"}
+    INCIDENTS.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rec, indent=1) + "\n")
 
 
 def budget_short_incident(out: dict) -> None:

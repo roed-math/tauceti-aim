@@ -88,6 +88,7 @@ item("lookahead-failed-A-pushed", kind="lookahead", what="failed", target="A/pus
 item("lookahead-failed-A-idle", kind="lookahead", what="failed", target="A/idle", branch="lookahead/A/idle")
 item("lookahead-failed-A-gone", kind="lookahead", what="failed", target="A/gone", branch="lookahead/A/gone")
 item("budget-short-claude", kind="budget-short", key="claude")
+item("budget-blind-claude", kind="budget-blind", key="claude")
 tf.LOOKAHEAD_DIR.mkdir()
 (tf.LOOKAHEAD_DIR / "branches.json").write_text(json.dumps({"at": NOW - 60, "fork": "f/f", "branches": [
     {"area": "A", "slug": "read", "sha": "1" * 40, "status": "partial", "built_at": NOW - 4 * 3600},
@@ -115,7 +116,8 @@ check("a decline the decide stage has yet to rule on is not read or touched",
 check("an unreadable branch clears once its header reads", cleared.get("lookahead-unreadable-A-read", {}).get("resolved_cause") == "branch reads")
 check("a failed branch clears once pushed since", cleared.get("lookahead-failed-A-pushed", {}).get("resolved_cause") == "branch pushed")
 check("...or once the listing no longer has it", cleared.get("lookahead-failed-A-gone", {}).get("resolved_cause") == "branch gone")
-check("a budget warning clears outside the slot", cleared.get("budget-short-claude", {}).get("resolved_cause") == "slot ended")
+check("a budget warning clears outside the slot", all(cleared.get(k, {}).get("resolved_cause") == "slot ended"
+                                                      for k in ("budget-short-claude", "budget-blind-claude")))
 check("cleared items are reported as such", len(lines) == len(cleared) and len(tf.recent_clears()) == len(cleared))
 
 item("budget-short-claude", kind="budget-short", key="claude")

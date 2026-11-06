@@ -192,6 +192,10 @@ and the cap with its reason. Each change is a line in `watchdog.log`. When the w
 outside the list would alone use up the budget before the slot ends, the attention list gets a
 `budget-short` item: switch fleets early or lower the load.
 
+The controller reads the same usage responses the workers cache, a worker's own or, in token mode,
+the one beside the usage login. A reading over 30 minutes old moves nothing and the view marks it
+`stale`. After two hours of that on a running fleet, the attention list gets a `budget-blind` item.
+
 ## Watching all fleets
 
 Each fleet can publish its live view as `<fleet.status_dir>/<name>.json`, after every round and on

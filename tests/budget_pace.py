@@ -170,6 +170,53 @@ check("after the claim the burn is measured from the claim on", out["R"] is not 
 check("…the reset is no longer counted, and the reminder clears",
       out["extra"] == 0 and abs(out["B"] - 0.97) < 1e-9 and not reset_item.exists(), str(out))
 
+# ---- token mode: the workers cache Claude readings beside the usage login, not in their own state -----------
+t = time.time()
+reading(100.0, t - 5 * 86400)  # what a worker left behind when the fleet moved to token mode
+tf.USAGE_CACHE.mkdir(parents=True)
+
+
+def shared_reading(used, at):
+    (tf.USAGE_CACHE / "quota-claude.json").write_text(json.dumps({"fetched_at": at, "payload": {
+        "five_hour": None, "seven_day": {"utilization": used, "resets_at": datetime.fromtimestamp(resets).astimezone().isoformat()}}}))
+
+
+shared_reading(12.0, t - 60)
+check("a shared reading beats a worker's old one", tf.newest_quota_cache("claude")[1:] == (t - 60, "usage login"), str(tf.newest_quota_cache("claude")[1:]))
+check("the pacer reads it too", tf.claude_week_reading() == (t - 60, 12.0, tf._parse_iso(datetime.fromtimestamp(resets).astimezone().isoformat())))
+out = tf.budget_pace(force=True)
+check("so a token-mode fleet keeps stepping", abs(out["B"] - 0.88) < 1e-9 and out["reading_at"] == t - 60, str(out))
+row = tf.usage_text().plain
+check("the view names the source and shows the real figure", "7d 88% left" in row and "[usage login," in row and "stale" not in row, row)
+shared_reading(12.0, t - 2 * tf.PACE_STALE)
+check("an old reading is marked stale", "stale]" in tf.usage_text().plain, tf.usage_text().plain)
+(tf.USAGE_CACHE / "quota-claude.json").unlink()
+(w1 / "cache" / "quota-claude.json").write_text(json.dumps({"fetched_at": t - 60, "payload": {"seven_day": {"utilization": 7.0}}}))
+check("a worker's own reading still counts without a shared one", tf.newest_quota_cache("claude")[2] == w1.name)
+
+blind = tf.INCIDENTS / "budget-blind-claude.json"
+tf.budget_blind_incident(t, t - 86400)
+check("a first stale reading raises nothing: the fleet may just have started", not blind.exists())
+tf.budget_blind_incident(t + tf.PACE_BLIND - 60, t - 86400)
+check("…nor one just inside the limit", not blind.exists())
+tf.budget_blind_incident(t + tf.PACE_BLIND + 60, t - 86400)
+item = json.loads(blind.read_text()) if blind.exists() else {}
+check("a running fleet past the limit gets an item", item.get("kind") == "budget-blind" and "fallback_auto_min" in item.get("detail", ""), str(item))
+tf.budget_blind_incident(t + tf.PACE_BLIND + 120, t + tf.PACE_BLIND + 100)
+check("a current reading clears it and the clock", not blind.exists() and not tf.BLIND_SINCE.exists())
+tf.budget_blind_incident(t, None)
+tf.budget_blind_incident(t + 2 * tf.PACE_BLIND, None)
+check("a gap in the calls means the fleet was off: the clock restarts", not blind.exists()
+      and json.loads(tf.BLIND_SINCE.read_text())["since"] == t + 2 * tf.PACE_BLIND)
+tf.budget_blind_incident(t + 2.5 * tf.PACE_BLIND, None)
+tf.budget_blind_incident(t + 3 * tf.PACE_BLIND + 60, None)
+check("…and no reading at all counts as blind", blind.exists() and "there is none" in json.loads(blind.read_text())["detail"])
+
+phrase = lambda d, h=0: tf._reset_phrase((datetime.now().replace(hour=12, minute=0) + timedelta(days=d, hours=h)).timestamp())  # noqa: E731
+day = lambda d: datetime.now().replace(hour=12) + timedelta(days=d)  # noqa: E731
+check("a reset this week gives the weekday", phrase(6) == f"resets {day(6):%a} 12:00", phrase(6))
+check("a reset a week or more away gives the date", phrase(14) == f"resets {day(14):%a %m-%d} 12:00", phrase(14))
+
 tf.manager_alive = lambda: False
 tf.FALLBACK_CAP.write_text(json.dumps({"at": 0}))
 check("a stopped fleet takes no step", tf.budget_pace(force=True).get("cap") is None)
