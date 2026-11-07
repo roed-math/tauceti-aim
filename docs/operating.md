@@ -49,6 +49,39 @@ worker's old entry and switches it at a later reconcile that finds it between ro
 line lists these as `deferred (mid-round)`. `tauceti-aim reconcile --dry-run` shows what a pass
 would do.
 
+## Waiting for host load
+
+A `lake build` takes every core a container can see, and rounds that overlap slow each other until they
+hit the round timeout. On one 32-core host over 8 days (2026-10-30 to 11-06), finished rounds per hour
+peaked at load 32-64 (11.8) and fell to 5.3 above 192, while the share that failed rose from 4% to 14-21%.
+
+With `up.max_load` set, a worker's loop holds before a build-heavy round while the host's 1- or 5-minute
+load is at or above the limit. The view shows the worker as `waiting-load` and has a `host load` row. A held
+worker reads no quota or GitHub state and spends no tokens, and the wait does not count against the round
+timeout. Reviewers and the other light stages (`curate`, `decide`, `progress`, `overlap-scan`) do not wait,
+nor does a one-off `tauceti-aim round`.
+
+A new round's first build comes minutes after it starts, so starts are also spaced: a worker takes the slot
+in `up.load_gate_dir` just before launching, and the next waits until `up.load_spacing` seconds have passed
+(180 by default) or that round has ended, since a round that ended adds no load. Fleets on one host should
+name the same directory, created by hand with group write and setgid:
+
+```bash
+mkdir /home/shared/fleet/load-gate
+chmod 2775 /home/shared/fleet/load-gate
+```
+
+The gate only controls starts, so a round already running keeps its cores whatever the load does. To keep
+other work on the host responsive during that time, raise its CPU weight above the containers', each of
+which has the same weight as all of `user.slice`:
+
+```bash
+sudo systemctl set-property user.slice CPUWeight=1000
+```
+
+If the load cannot be read or the slot cannot be written, rounds start anyway: the worker's log says so
+once, and the `host load` row names a directory the user cannot write.
+
 ## The GitHub gate
 
 Every request the workers and the tool make as the fleet's account goes through one gate store

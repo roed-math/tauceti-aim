@@ -151,6 +151,12 @@ DEFAULT_CLAUDE_EFFORT = setting("models", "claude_effort", "high")
 MATHLIB_STORE = FLEET_HOME / "mathlib-store" if _setting_bool("up", "mathlib_store") else None
 PERSISTENT_BUILD = _setting_bool("up", "persistent_build")
 STORE_GRACE_S = 6 * 3600  # a revision unpinned this long is pruned; a round started before may still use it
+# `up.max_load`: build-heavy rounds wait while the host's load is at or above this and then start one at a
+# time, through a slot in `up.load_gate_dir` that the fleets on one host share (the worker's host_load).
+MAX_LOAD = setting("up", "max_load")
+LOAD_SPACING = setting("up", "load_spacing")
+_LOAD_GATE_DIR_RAW = setting("up", "load_gate_dir")
+LOAD_GATE_DIR = _expand(_LOAD_GATE_DIR_RAW) if _LOAD_GATE_DIR_RAW else FLEET_HOME / "load-gate"
 API = setting("claude", "billing", "subscription").strip().lower() == "api"
 API_KEY_FILE = _expand(setting("claude", "api_key_file", "~/.config/tauceti/anthropic.key"))
 API_BUDGET = setting("claude", "budget", "true").strip().lower() not in ("false", "0", "no")
@@ -702,6 +708,8 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             # Attempt budgets too: one stuck PR spends its budget once, not once per fleet.
             **({"TAUCETI_SHARED_ATTEMPTS_DIR": str(SHARED_CACHE / "attempts")} if SHARED_CACHE else {}),
             **({"TAUCETI_OWN_BRANCHES": OWN_BRANCHES} if OWN_BRANCHES else {}),
+            **({"TAUCETI_MAX_LOAD": MAX_LOAD, "TAUCETI_LOAD_GATE_DIR": str(LOAD_GATE_DIR)} if MAX_LOAD else {}),
+            **({"TAUCETI_LOAD_SPACING": LOAD_SPACING} if MAX_LOAD and LOAD_SPACING else {}),
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING is not None else {}),
@@ -1563,13 +1571,30 @@ def health(st: dict) -> tuple[str, str]:
         return "stuck? (round overdue)", "red"
     if state == "backoff" and st.get("next_action_at"):
         return f"backoff ({until(st.get('next_action_at'))})", "green"  # a scheduled retry is normal, not ill health
-    if state in ("waiting-quota", "waiting-github"):
+    if state in ("waiting-quota", "waiting-github", "waiting-load"):
         return state, "yellow"
     if state in ("running", "surveying"):
         return state, "green"
     if state == "idle":
         return "idle", "green"
     return state, "yellow"
+
+
+def load_line(statuses: dict, enabled_ids: list[str]) -> str:
+    """The host's load against `up.max_load`, and how many of this fleet's workers it is holding. A disabled
+    worker's status file still describes its last loop, so only enabled ones count."""
+    try:
+        one, five, _ = os.getloadavg()
+    except OSError:
+        return "unknown"
+    now = f"{max(one, five):.0f}"
+    if not MAX_LOAD:
+        return f"{now} (no limit: up.max_load is unset)"
+    held = sum(statuses.get(w, {}).get("state") == "waiting-load" for w in enabled_ids)
+    line = f"{now}, build rounds wait at {MAX_LOAD}; {held} worker{'' if held == 1 else 's'} waiting now"
+    if LOAD_GATE_DIR.exists() and not os.access(LOAD_GATE_DIR, os.W_OK | os.X_OK):
+        line += f"; starts are not spaced: this user cannot write {LOAD_GATE_DIR}"
+    return line
 
 
 def pool_line() -> str:
@@ -3024,6 +3049,7 @@ def view_data(progress: Progress) -> dict:
         progress.creds = cached_credential_lines()
         progress.creds_at = time.time()
     after.append([_cell("usage"), _cell(usage_text())])
+    after.append([_cell("host load"), _cell(Text(load_line(statuses, enabled_ids), overflow="fold"))])
     after.append([_cell("credentials"), _cell(Text.assemble(*[(t + "   ", st) for t, st in progress.creds]))])
     after.append([_cell("mathlib pool"), _cell(Text(pool_line(), overflow="fold"))])
     if progress.remote_ok:  # the GitHub panel; without --refresh it never runs, so there is nothing to date
