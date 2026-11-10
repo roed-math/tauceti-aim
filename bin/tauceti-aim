@@ -2763,7 +2763,8 @@ def lookahead_line() -> str | None:
         pass
     if not (LOOKAHEAD_ENV or rows or hist):
         return None
-    parts = ["on" if LOOKAHEAD_SETTING else "passive" if LOOKAHEAD_ENV else "off"]
+    parts = ["on" if LOOKAHEAD_SETTING else "ports only" if LOOKAHEAD_MODE == "ports"
+             else "passive" if LOOKAHEAD_ENV else "off"]
     live = ", ".join(f"{r.get('slug')} ({r.get('status')})" for r in rows)
     parts.append(f"{len(rows)} branch(es) live{': ' + live if live else ''}")
     sessions = [r for r in hist if r.get("event") == "session"]
@@ -3882,10 +3883,14 @@ BUDGET_EXTRA_UNTIL = str(setting("authoring", "budget_extra_until", "") or "")
 # proves a blocked item against stubs of its in-flight supplier, on a branch of the account's fork,
 # before it would author outside the list; an author ports the branch once the supplier lands. Off
 # unless set; only the worker reads it (TAUCETI_LOOKAHEAD).
+LOOKAHEAD_MODE = setting("authoring", "lookahead").lower()
 LOOKAHEAD_SETTING = _setting_bool("authoring", "lookahead")
-# true: sessions and ports. false: passive, holding an item whose branch awaits its port and sweeping
-# finished branches, for a fleet that rotates with lookahead fleets. Absent: none of it, no env at all.
-LOOKAHEAD_ENV = {"TAUCETI_LOOKAHEAD": "1" if LOOKAHEAD_SETTING else "0"} if setting("authoring", "lookahead") else {}
+# true: sessions and ports. "ports": the branches there are are ported and no session starts (owner,
+# 2026-11-09: the campaign lookahead served is complete). false: passive, holding an item whose branch
+# awaits its port and sweeping finished branches, for a fleet that rotates with lookahead fleets.
+# Absent: none of it, no env at all.
+LOOKAHEAD_ENV = ({"TAUCETI_LOOKAHEAD": "ports" if LOOKAHEAD_MODE == "ports" else "1" if LOOKAHEAD_SETTING else "0"}
+                 if LOOKAHEAD_MODE else {})
 
 
 # The status labels a fix worker has work on: review findings (fix) and red builds (fix-ci).
@@ -5023,7 +5028,8 @@ reads_per_hour = 600
 # budget_extra_until = "2026-10-22T00:00"
 # Before that, prove a blocked item ahead of its in-flight supplier, against stubs, on a branch
 # lookahead/<area>/<slug> of the account's fork, and port it once the supplier lands. true: on;
-# false: passive (hold items whose branch awaits its port, sweep finished branches); absent: none of it.
+# "ports": port the branches there are, prove nothing new; false: passive (hold items whose branch
+# awaits its port, sweep finished branches); absent: none of it.
 # lookahead = false
 
 [decide]

@@ -176,10 +176,10 @@ outside the list; the number of live branches is not capped. The claim is `looka
 separate from the item's author claim.
 
 When the suppliers land, the item becomes eligible and an author ports the branch: it opens the
-plan's next split as a pull request, the stubs replaced by the landed declarations. One PR per round,
-but while a split that does not wait on another is still unopened, the item stays available to the
-next round, so independent splits are opened without waiting for each other to merge. Every port PR
-carries a `tauceti-lookahead-port:v1` marker, which is how the next round knows what is open.
+plan's next split as a pull request, the stubs replaced by the landed declarations. One split is
+open at a time: TauCeti's housekeeping closes the newer of two open PRs that carry one target id,
+so the next split is offered once no PR of the item is open. Every port PR carries a
+`tauceti-lookahead-port:v1` marker, which is how the next round knows what is open and merged.
 A complete branch that stubs nothing (everything the item uses has landed, though a listed need is
 not complete) is ported at once, without waiting for that need.
 
@@ -187,6 +187,8 @@ All of this state is on GitHub, so it does not matter which fleet is active. The
 deletes the branch of an item that is done, and a branch whose every planned split has merged
 (spent: it has nothing left to port, even if its item still lacks something), and lists stale branches (built on a `main` more than a
 week old) and branches whose item is not on the list; it never deletes those. With
+`authoring.lookahead = "ports"` a fleet ports the branches there are and starts no session, so
+the live branches run down as their splits merge. With
 `authoring.lookahead = false` a fleet is passive: it proves and ports nothing, but sweeps branches,
 and leaves an eligible item with a fresh branch for six hours (`TAUCETI_LOOKAHEAD_HOLD_HOURS`)
 before authoring it fresh. Without the setting a fleet does none of this and never lists the
